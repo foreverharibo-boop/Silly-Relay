@@ -48,10 +48,10 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         let body = init?.body;
         if (body === undefined && request && !request.bodyUsed) body = await request.clone().text();
         if (typeof body !== 'string') {
-            throw new Error('연결 유지 시험판은 JSON 생성 요청만 지원합니다. 시험 기능을 끈 뒤 다시 시도해 주세요.');
+            throw new Error('Silly Relay은 JSON 생성 요청만 지원합니다. 연결 유지를 끈 뒤 다시 시도해 주세요.');
         }
         try { const parsed = JSON.parse(body); if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error(); }
-        catch { throw new Error('연결 유지 시험판에서 생성 요청 본문을 읽지 못했습니다.'); }
+        catch { throw new Error('Silly Relay에서 생성 요청 본문을 읽지 못했습니다.'); }
         const signal = init?.signal ?? request?.signal;
         if (signal?.aborted) throw abortError();
         const headers = new Headers(init?.headers ?? request?.headers);

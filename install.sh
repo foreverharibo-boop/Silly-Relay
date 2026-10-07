@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local test installer. No downloads, no config edits, no existing directory overwrites.
+# Local installer. No downloads, no config edits, no existing directory overwrites.
 relay_source="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 st_root="${1:-$HOME/SillyTavern}"
 st_handle="${2:-}"
@@ -39,6 +39,6 @@ cp -R -- "$relay_source/server" "$plugin_dest/server"
 for relay_file in manifest.json index.js transport.mjs recovery.mjs identity.mjs style.css LICENSE; do
     cp -- "$relay_source/$relay_file" "$extension_dest/"
 done
-echo "Silly Relay 시험판 설치 완료"
+echo "Silly Relay 1.0.0 설치 완료"
 echo "config.yaml의 enableServerPlugins: true를 확인하고 서버를 완전히 재시작해 주세요."
-echo "실리를 새로고침한 뒤 확장 설정 → Silly Relay → 연결 확인 → 연결 유지 시험 기능을 켜세요."
+echo "실리를 새로고침한 뒤 확장 설정 → Silly Relay → 연결 확인 → 연결 유지을 켜세요."

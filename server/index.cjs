@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '0.1.0-test.6';
+const VERSION = '1.0.0';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -96,7 +96,7 @@ function createRelay(overrides = {}) {
         if (!ID.test(String(id)) || !PATHS.has(path) || typeof body !== 'string') {
             throw fail(400, '지원하지 않는 생성 요청입니다.');
         }
-        if (Buffer.byteLength(body) > limits.requestBytes) throw fail(413, '시험판 요청 크기 한도를 초과했습니다.');
+        if (Buffer.byteLength(body) > limits.requestBytes) throw fail(413, '요청 크기 한도를 초과했습니다.');
         try {
             const parsed = JSON.parse(body);
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
@@ -110,7 +110,7 @@ function createRelay(overrides = {}) {
         }
         // Use the actual accepted server socket, never a URL or port supplied by a client.
         // This prototype supports HTTP ST servers, including HTTPS terminated by a reverse proxy.
-        if (req.socket.encrypted) throw fail(409, '시험판은 실리태번 자체 HTTPS 모드를 아직 지원하지 않습니다.');
+        if (req.socket.encrypted) throw fail(409, 'Silly Relay는 실리태번 자체 HTTPS 모드를 지원하지 않습니다.');
         if (!req.socket.localAddress || !req.socket.localPort) throw fail(503, '실리태번 서버 주소를 확인할 수 없습니다.');
         const pending = [...jobs.values()].filter(j => j.state === 'running' || j.state === 'completed');
         const active = pending.filter(j => j.state === 'running');
@@ -138,7 +138,7 @@ function createRelay(overrides = {}) {
             job.events.emit('change');
             const encoding = response.headers['content-encoding'];
             if (encoding && encoding !== 'identity') {
-                finish(job, 'failed', '압축된 서버 응답은 이 시험판에서 지원하지 않습니다.');
+                finish(job, 'failed', '압축된 서버 응답은 Silly Relay에서 지원하지 않습니다.');
                 upstream.destroy();
                 return;
             }
@@ -146,7 +146,7 @@ function createRelay(overrides = {}) {
             response.on('data', chunk => {
                 if (job.state !== 'running') return;
                 if (job.size + chunk.length > limits.responseBytes || totalBytes + chunk.length > limits.totalBytes) {
-                    finish(job, 'failed', '시험판 응답 전송 크기 한도를 초과했습니다.');
+                    finish(job, 'failed', '응답 전송 크기 한도를 초과했습니다.');
                     upstream.destroy();
                     return;
                 }

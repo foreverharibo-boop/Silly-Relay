@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=0.1.0-test.8';
-import { createRecovery } from './recovery.mjs?v=0.1.0-test.8';
-import { recoveryIdentity } from './identity.mjs?v=0.1.0-test.8';
+import { createTransport } from './transport.mjs?v=1.0.0';
+import { createRecovery } from './recovery.mjs?v=1.0.0';
+import { recoveryIdentity } from './identity.mjs?v=1.0.0';
 
-const VERSION = '0.1.0-test.8';
+const VERSION = '1.0.0';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -63,7 +63,7 @@ async function check() {
     checking = true;
     try {
         const result = await transport.api('/status', { headers: headers() });
-        if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 시험판을 사용할 수 없습니다.');
+        if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
         state = `서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
@@ -111,7 +111,7 @@ function initialize() {
     panel.innerHTML = `<div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header"><b>Silly Relay <small>${VERSION}</small></b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
         <div class="inline-drawer-content">
-            <label class="checkbox_label"><input type="checkbox"><span>연결 유지 시험 기능</span></label>
+            <label class="checkbox_label"><input type="checkbox"><span>연결 유지</span></label>
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
             <p data-status></p><small data-last></small>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
@@ -130,7 +130,7 @@ function initialize() {
     panel.querySelector('[data-check]').addEventListener('click', check);
     panel.querySelector('[data-previous-panel]').hidden = !standalone;
     panel.querySelector('[data-previous]').addEventListener('click', async event => {
-        if (!active) { notify('연결 유지 시험 기능을 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
+        if (!active) { notify('연결 유지을 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
         const button = event.currentTarget;
         button.disabled = true;
         try { await recovery.recoverPreviousSession(); }
