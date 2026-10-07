@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '0.1.0-test.2';
+const VERSION = '0.1.0-test.3';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -176,8 +176,8 @@ function createRelay(overrides = {}) {
             catch (error) { return res.status(error.status || 500).json({ error: error.status ? error.message : '서버 처리 오류입니다.' }); }
         };
         router.get('/status', wrap((req, res) => {
-            ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted });
+            const owner = ownerOf(req);
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, owner });
         }));
         router.post('/jobs', wrap((req, res) => res.status(202).json(describe(start(req)))));
         router.get('/jobs/:id', wrap((req, res) => {

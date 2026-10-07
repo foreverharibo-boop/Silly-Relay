@@ -1,4 +1,4 @@
-// Browser transport: no AI SDK, prompt changes, or chat writes.
+// Browser transport: no AI SDK or prompt changes.
 export const API = '/api/plugins/silly-relay';
 export const PATHS = new Set([
     '/api/backends/chat-completions/generate', '/api/backends/text-completions/generate',
@@ -17,7 +17,8 @@ function decode(data) {
 }
 
 export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {},
-    saveCancellation = () => {}, requestTimeout = 30000, retryDelay = 1000, startRetryMs = 60000 }) {
+    saveCancellation = () => {}, prepareRecovery = async () => false,
+    requestTimeout = 30000, retryDelay = 1000, startRetryMs = 60000 }) {
     function emit(type, detail = {}) { try { onEvent(type, detail); } catch { /* UI never owns the request. */ } }
     async function api(path, init = {}) {
         const controller = new AbortController();
@@ -57,6 +58,10 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         headers.set('content-type', 'application/json');
         const credentials = init?.credentials ?? request?.credentials ?? 'same-origin';
         const id = newId();
+        // Persist the binding BEFORE submitting a billable request. Recoverable replies
+        // are acknowledged by the chat layer only after the saved message is verified.
+        const retainForRecovery = await prepareRecovery({ id, path: url.pathname, body });
+        if (signal?.aborted) { emit('cancelled', { id }); throw abortError(); }
         let stopped = false;
         let detached = false;
         let streamController;
@@ -96,9 +101,10 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             if (stopped) { void sendCancel(); throw abortError(); }
             if (startInfo.state === 'cancelled') throw abortError();
             if (startInfo.state === 'delivered') throw new Error('이미 전달이 끝난 요청입니다.');
-            emit('accepted', { id });
+            emit('accepted', { id, reloadRecovery: !!retainForRecovery });
             let cursor = 0;
             async function acknowledge() {
+                if (retainForRecovery) return;
                 // This is a receipt, never another AI request. Lost receipts are harmless;
                 // the unacknowledged temporary buffer also has a fixed expiry.
                 for (let attempt = 0; attempt < 3; attempt++) {

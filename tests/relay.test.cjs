@@ -287,3 +287,187 @@ test('browser automatically acknowledges a complete response without an archive 
     await delay(50);
     assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
 });
+
+// Each makePage() has a fresh JS heap, but the tab journal and saved ST chat survive.
+async function recoveryBrowser(t, f) {
+    const { createRecovery, MARK } = await import('../recovery.mjs');
+    const { createTransport } = await import('../transport.mjs');
+    const copy = data => JSON.parse(JSON.stringify(data));
+    const storageMap = new Map();
+    const storage = { getItem: key => storageMap.get(key) || null, setItem: (key, value) => storageMap.set(key, value) };
+    const disk = { messages: [{ name: 'User', is_user: true, mes: '안녕', send_date: '2026-10-07' }], failSave: false };
+    const messages = [], rendered = [], emitted = [];
+    async function makePage(tabId = 'same-tab') {
+        const ctx = { chat: copy(disk.messages), characters: [{ avatar: 'Char.png' }], characterId: 0,
+            chatId: 'Chat A', name2: 'Character', groupId: null, chatCompletionSettings: { chat_completion_source: 'custom' },
+            eventTypes: { MESSAGE_RECEIVED: 'received', CHARACTER_MESSAGE_RENDERED: 'rendered' },
+            eventSource: { emit: async (...args) => emitted.push(args) },
+            addOneMessage: m => rendered.push(m),
+            saveChat: async () => { if (!disk.failSave) disk.messages = copy(ctx.chat); } };
+        const request = async (url, init) => {
+            if (url === '/api/chats/get') return Response.json([{ chat_metadata: {} }, ...copy(disk.messages)]);
+            return fetch(url, init);
+        };
+        let recovery;
+        const transport = createTransport({ fetchImpl: request, origin: f.base, enabled: () => true,
+            prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => recovery.event(type, data) });
+        recovery = createRecovery({ getContext: () => ctx, api: transport.api, fetchImpl: request,
+            getHeaders: () => AUTH, storage, tabId, notify: text => messages.push(text) });
+        t.after(() => recovery.stop());
+        const arm = () => { recovery.generationStarted('normal'); recovery.dataReady({}, false); };
+        return { ctx, recovery, transport, arm };
+    }
+    return { makePage, disk, messages, rendered, emitted, MARK };
+}
+
+test('reload before completion restores JSON and split-Unicode SSE into the original chat exactly once', async t => {
+    for (const stream of [false, true]) {
+        const f = await fixture(t, { pageBytes: 7 });
+        const b = await recoveryBrowser(t, f);
+        const page = await b.makePage();
+        page.arm();
+        const jobId = id();
+        assert.equal(await page.recovery.prepare({ id: jobId, path: PATH, body: JSON.stringify({ type: 'normal', stream }) }), true);
+        await f.start(jobId, { stream, duration: 100 });
+        page.recovery.stop(); // Page was discarded; none of its promises can resume.
+        const otherTab = await b.makePage('other-tab');
+        await otherTab.recovery.recover();
+        assert.equal(b.disk.messages.length, 1);
+        const reloaded = await b.makePage();
+        await reloaded.recovery.recover();
+        assert.equal(b.disk.messages.length, 2);
+        assert.equal(b.disk.messages[1].mes, stream ? '안녕 🤍' : '서버가 끝까지 받은 답장 🤍');
+        assert.equal(b.disk.messages[1].extra[b.MARK].id, jobId);
+        assert.equal(b.disk.messages[1].extra[b.MARK].complete, true);
+        assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+        await reloaded.recovery.recover();
+        await (await b.makePage()).recovery.recover();
+        assert.equal(b.disk.messages.length, 2);
+        assert.equal(f.calls.length, 1);
+        assert.equal(b.emitted.filter(e => e[0] === 'received').length, 1);
+    }
+});
+
+test('transport EOF is not a chat-save receipt: reload after reading bytes still recovers', async t => {
+    const f = await fixture(t);
+    const b = await recoveryBrowser(t, f);
+    const page = await b.makePage();
+    page.arm();
+    const response = await page.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: JSON.stringify({ type: 'normal', duration: 30 }) });
+    const jobId = response.headers.get('x-silly-relay-job');
+    await response.text();
+    assert.equal((await f.get(jobId)).state, 'completed');
+    assert.equal(b.disk.messages.length, 1);
+    page.recovery.stop();
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages.length, 2);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.equal(f.calls.length, 1);
+});
+
+test('normal live completion deletes the response only after the marked chat is saved', async t => {
+    const f = await fixture(t);
+    const b = await recoveryBrowser(t, f);
+    const page = await b.makePage(); page.arm();
+    const response = await page.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"type":"normal","duration":25}' });
+    const jobId = response.headers.get('x-silly-relay-job');
+    const data = await response.json();
+    page.ctx.chat.push({ name: 'Character', is_user: false, mes: data.choices[0].message.content, extra: {} });
+    page.recovery.tag(1, true);
+    await page.recovery.settle();
+    assert.equal((await f.get(jobId)).state, 'completed');
+    await page.ctx.saveChat();
+    await page.recovery.settle();
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages.length, 2);
+});
+
+test('a failed recovery save retains the reply; retry saves the same message without duplication', async t => {
+    const f = await fixture(t);
+    const b = await recoveryBrowser(t, f);
+    const page = await b.makePage(); page.arm(); const jobId = id();
+    await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 20 }); page.recovery.stop();
+    const fresh = await b.makePage(); b.disk.failSave = true;
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat.length, 2);
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal((await f.get(jobId)).state, 'completed');
+    b.disk.failSave = false;
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat.length, 2);
+    assert.equal(b.disk.messages.length, 2);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+});
+
+test('wrong chat, edited history and a new unmarked answer are never overwritten', async t => {
+    for (const conflict of ['wrong-chat', 'edit', 'new-answer']) {
+        const f = await fixture(t); const b = await recoveryBrowser(t, f);
+        const page = await b.makePage(); page.arm(); const jobId = id();
+        await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        await f.start(jobId, { duration: 20 }); page.recovery.stop();
+        if (conflict === 'edit') b.disk.messages[0].mes = '사용자가 고친 내용';
+        if (conflict === 'new-answer') b.disk.messages.push({ name: 'Character', is_user: false, mes: '다른 답장' });
+        const original = JSON.stringify(b.disk.messages);
+        const fresh = await b.makePage();
+        if (conflict === 'wrong-chat') fresh.ctx.chatId = 'Chat B';
+        await fresh.recovery.recover();
+        assert.equal(JSON.stringify(b.disk.messages), original);
+        assert.equal(b.rendered.length, 0);
+        assert.equal(f.calls.length, 1);
+    }
+});
+
+test('a saved partial message with this job marker is replaced, not appended', async t => {
+    const f = await fixture(t); const b = await recoveryBrowser(t, f);
+    const page = await b.makePage(); page.arm(); const jobId = id();
+    await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 20 });
+    page.ctx.chat.push({ name: 'Character', is_user: false, mes: '서버가 끝까', extra: {} });
+    page.recovery.tag(1, false); await page.ctx.saveChat(); page.recovery.stop();
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages.length, 2);
+    assert.equal(b.disk.messages[1].mes, '서버가 끝까지 받은 답장 🤍');
+});
+
+test('hidden/quiet/tool/group requests never acquire a chat recovery binding; explicit stop removes it', async t => {
+    const f = await fixture(t); const b = await recoveryBrowser(t, f); const p = await b.makePage();
+    for (const data of [{ type: 'quiet' }, { type: 'swipe' }, { type: 'normal', tools: [{}] }, { type: 'normal', n: 2 }]) {
+        p.arm(); assert.equal(await p.recovery.prepare({ id: id(), path: PATH, body: JSON.stringify(data) }), false);
+    }
+    p.ctx.groupId = 'group'; p.arm();
+    assert.equal(await p.recovery.prepare({ id: id(), path: PATH, body: '{"type":"normal"}' }), false);
+    p.ctx.groupId = null; p.arm();
+    assert.equal(await p.recovery.prepare({ id: id(), path: PATH, body: '{"type":"normal"}' }), true);
+    assert.equal(p.recovery.list().length, 1);
+    p.recovery.generationStopped();
+    assert.equal(p.recovery.list().length, 0);
+    assert.equal(f.calls.length, 0);
+});
+
+test('recovery decoder keeps SSE metadata out of the reply and rejects errors/tools', async () => {
+    const { decodeReply } = await import('../recovery.mjs');
+    const record = { stream: true, mainApi: 'openai' };
+    const raw = ': heartbeat\r\n\r\ndata: {"choices":[{"delta":{"reasoning_content":"생각","content":"안"}}]}\r\n\r\ndata: {"choices":[{"delta":{"content":"녕"}}]}\r\n\r\ndata: {"usage":{"tokens":3}}\r\n\r\ndata: [DONE]\r\n\r\n';
+    assert.deepEqual(decodeReply(raw, record), { text: '안녕', reasoning: '생각', signature: null });
+    assert.throws(() => decodeReply('data: {"error":"bad"}\n\n', record), /오류/);
+    assert.throws(() => decodeReply('data: {"choices":[{"delta":{"tool_calls":[{}]}}]}\n\n', record), /도구 호출/);
+    assert.throws(() => decodeReply('data: {"usage":{"tokens":3}}\n\n', record), /텍스트/);
+});
+
+test('failed upstream and expired jobs leave no automatic retry or fabricated chat message', async t => {
+    for (const mode of ['error', 'expired']) {
+        const f = await fixture(t, mode === 'expired' ? { retentionMs: 25 } : {});
+        const b = await recoveryBrowser(t, f); const p = await b.makePage(); p.arm(); const jobId = id();
+        await p.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        await f.start(jobId, { duration: 10, error: mode === 'error' }); p.recovery.stop();
+        await delay(mode === 'expired' ? 80 : 20);
+        const next = await b.makePage(); await next.recovery.recover();
+        assert.equal(b.disk.messages.length, 1);
+        assert.equal(next.recovery.list().length, 0);
+        assert.equal(f.calls.length, 1);
+        assert.ok(b.messages.length > 0);
+    }
+});
