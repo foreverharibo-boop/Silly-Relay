@@ -18,7 +18,7 @@ test('installer uses selected user, leaves config intact, and refuses an existin
     assert.equal(result.status, 0, result.stderr);
     assert.equal(require(path.join(root, 'plugins', 'Silly-Relay', 'server', 'index.cjs')).info.id, 'silly-relay');
     const manifest = JSON.parse(fs.readFileSync(path.join(root, 'data', 'alice', 'extensions', 'Silly-Relay', 'manifest.json')));
-    assert.equal(manifest.version, '0.1.0-test.7');
+    assert.equal(manifest.version, '0.1.0-test.8');
     assert.equal(fs.readFileSync(path.join(root, 'config.yaml'), 'utf8'), 'enableServerPlugins: true\n');
     const again = spawnSync('bash', [script, root], { encoding: 'utf8' });
     assert.equal(again.status, 1);

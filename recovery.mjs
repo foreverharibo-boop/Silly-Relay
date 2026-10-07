@@ -25,6 +25,24 @@ export function chatIdentity(ctx) {
     return { avatar, file };
 }
 const sameChat = (a, b) => !!a && !!b && a.avatar === b.avatar && a.file === b.file;
+const variants = message => Array.isArray(message?.swipes) ? message.swipes : [message?.mes];
+const isSwipe = record => Number.isInteger(record.swipeCount) && record.swipeCount > 0;
+function swipeAnchor(message, count) {
+    // Selection, current text and generation timestamps change during a swipe;
+    // previous candidate texts and the message identity must remain unchanged.
+    return fingerprint([{ ...message, mes: '', send_date: '', swipe_id: 0,
+        swipes: variants(message).slice(0, count) }]);
+}
+function completedPosition(record, chat) {
+    for (let index = 0; index < chat.length; index++) {
+        const message = chat[index];
+        if (message.extra?.[MARK]?.id === record.id && message.extra[MARK].complete
+            || message.swipe_info?.some(info => info?.extra?.[MARK]?.id === record.id && info.extra[MARK].complete)) {
+            return { done: true, index };
+        }
+    }
+    return null;
+}
 const textContent = value => typeof value === 'string' ? value : Array.isArray(value)
     ? value.filter(p => p.type === 'text' || !p.type).map(p => p.text || '').join('') : '';
 
@@ -132,9 +150,26 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         } finally { clearTimeout(timer); }
     }
     function position(record, chat) {
+        const done = completedPosition(record, chat);
+        if (done) return done;
         const existing = chat.findIndex(m => m.extra?.[MARK]?.id === record.id);
-        if (existing >= 0 && chat[existing].extra[MARK].complete) return { done: true, index: existing };
         if (fingerprint(chat.slice(0, record.count)) !== record.anchor) return null;
+        if (isSwipe(record)) {
+            const message = chat[record.count];
+            if (chat.length !== record.count + 1 || !message || message.is_user || message.is_system
+                || swipeAnchor(message, record.swipeCount) !== record.swipeAnchor) return null;
+            const swipes = variants(message);
+            if (swipes.length === record.swipeCount) {
+                const selected = message.swipe_id ?? 0;
+                if (selected < record.swipeCount && message.mes !== swipes[selected]) return null;
+                return { done: false, index: record.count };
+            }
+            if (swipes.length === record.swipeCount + 1
+                && (existing === record.count || message.swipe_info?.[record.swipeCount]?.extra?.[MARK]?.id === record.id)) {
+                return { done: false, index: record.count };
+            }
+            return null;
+        }
         if (chat.length === record.count) return { done: false, index: record.count };
         if (chat.length === record.count + 1 && existing === record.count && !chat[existing].is_user) {
             return { done: false, index: existing };
@@ -152,8 +187,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // over the file or firing generation/translation hooks a second time.
         if (!target || saved.length !== record.count + 1
             || fingerprint(saved.slice(0, record.count)) !== record.anchor
-            || !saved[record.count]?.extra?.[MARK]?.complete
-            || saved[record.count].extra[MARK].id !== record.id) {
+            || completedPosition(record, saved)?.index !== record.count
+            || isSwipe(record) && swipeAnchor(saved[record.count], record.swipeCount) !== record.swipeAnchor) {
             warn(record, '답장은 채팅 파일에 저장돼 있지만 현재 화면의 내용이 달라 자동으로 바꾸지 않았어요. 원래 채팅을 다시 열어 주세요.');
             return false;
         }
@@ -168,7 +203,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
-        if (!saved.some(m => m.extra?.[MARK]?.id === record.id && m.extra[MARK].complete)) return false;
+        if (!completedPosition(record, saved)) return false;
         if (!showSaved(record, saved)) return false;
         try {
             if (!Number.isSafeInteger(record.bytes)) {
@@ -194,27 +229,38 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     function generationStarted(type, options = {}, dryRun = false) {
         generating = !dryRun;
-        ticket = !dryRun && !options.quietToLoud && [undefined, 'normal', 'regenerate'].includes(type)
+        ticket = !dryRun && !options.quietToLoud && [undefined, 'normal', 'regenerate', 'swipe'].includes(type)
             ? { type: type || 'normal', identity: chatIdentity(getContext()), armed: false } : null;
     }
     function dataReady(_data, dryRun) { if (ticket && !dryRun) ticket.armed = true; }
     async function prepare({ id, path, body }) {
         const data = JSON.parse(body);
         // Never turn quiet/translation/review/tool requests into character messages.
-        if (!ticket?.armed || ![undefined, 'normal', 'regenerate'].includes(data.type)
+        if (!ticket?.armed || ![undefined, 'normal', 'regenerate', 'swipe'].includes(data.type)
             || path !== '/api/backends/chat-completions/generate' || (data.n || 1) > 1 || data.tools?.length) return false;
+        if ((data.type === 'swipe') !== (ticket.type === 'swipe') && data.type !== undefined) return false;
         const currentTicket = ticket;
         ticket = null;
         await identify();
         const ctx = getContext();
         const identity = chatIdentity(ctx);
         if (!sameChat(identity, currentTicket.identity)) return false;
-        const record = { id, tab: tabId, identity, count: ctx.chat.length, anchor: fingerprint(ctx.chat),
+        const swipe = currentTicket.type === 'swipe';
+        const previous = ctx.chat[ctx.chat.length - 1];
+        if (swipe && (!previous || previous.is_user || previous.is_system || !Array.isArray(previous.swipes)
+            || !previous.swipes.length || previous.swipe_id !== previous.swipes.length
+            || previous.swipes.some(text => typeof text !== 'string'))) return false;
+        const count = ctx.chat.length - (swipe ? 1 : 0);
+        const record = { id, tab: tabId, identity, count, anchor: fingerprint(ctx.chat.slice(0, count)),
             name: ctx.name2, created: Date.now(), stream: !!data.stream, mainApi: 'openai',
             source: data.chat_completion_source || ctx.chatCompletionSettings?.chat_completion_source,
             includeReasoning: typeof data.include_reasoning === 'boolean' ? data.include_reasoning
                 : ctx.chatCompletionSettings?.show_thoughts === true,
             model: typeof data.model === 'string' ? data.model : '', bytes: null };
+        if (swipe) {
+            record.swipeCount = previous.swipes.length;
+            record.swipeAnchor = swipeAnchor(previous, record.swipeCount);
+        }
         // ST already saves a normal user message before generating. Do not call
         // saveChat or read the entire chat on this critical path: a delayed save,
         // older file header or other extension must not block answer generation.
@@ -253,8 +299,11 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             const message = ctx.chat[index];
             if (index !== record.count || !message || message.is_user) continue;
             if (message.extra?.[MARK]?.id !== record.id && fingerprint(ctx.chat.slice(0, record.count)) !== record.anchor) continue;
+            if (isSwipe(record) && (message.swipe_id !== record.swipeCount
+                || swipeAnchor(message, record.swipeCount) !== record.swipeAnchor)) continue;
             message.extra ||= {};
-            message.extra[MARK] = { id: record.id, complete: !!complete || !!message.extra[MARK]?.complete };
+            const alreadyComplete = message.extra[MARK]?.id === record.id && message.extra[MARK].complete;
+            message.extra[MARK] = { id: record.id, complete: !!complete || !!alreadyComplete };
             const info = message.swipe_info?.[message.swipe_id ?? 0];
             if (info) { info.extra ||= {}; info.extra[MARK] = { ...message.extra[MARK] }; }
         }
@@ -315,6 +364,20 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 swipe_id: 0, swipes: [text] };
             message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
                 gen_finished: message.gen_finished, extra: JSON.parse(JSON.stringify(message.extra)) }];
+            if (isSwipe(record)) {
+                const previous = ctx.chat[target.index];
+                const previousInfo = previous.swipe_info || [{ send_date: previous.send_date,
+                    gen_started: previous.gen_started, gen_finished: previous.gen_finished,
+                    extra: JSON.parse(JSON.stringify(previous.extra || {})) }];
+                // Keep every original candidate and its metadata byte-for-byte.
+                // Replace only this request's partial slot, or append one new slot.
+                const info = message.swipe_info[0];
+                const extra = message.extra;
+                Object.assign(message, { ...previous, ...message,
+                    swipes: [...variants(previous).slice(0, record.swipeCount), message.mes],
+                    swipe_id: record.swipeCount,
+                    swipe_info: [...previousInfo.slice(0, record.swipeCount), info], extra });
+            }
             const replacing = target.index < ctx.chat.length;
             ctx.chat[target.index] = message;
             ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
@@ -324,9 +387,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             if (!position(record, durable)?.done) throw new Error('복구한 답장의 저장을 확인하지 못했습니다. 응답을 유지하고 다시 시도합니다.');
             if (sameChat(chatIdentity(getContext()), record.identity)) {
                 try {
-                    await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, target.index, 'normal');
+                    const type = isSwipe(record) ? 'swipe' : 'normal';
+                    await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, target.index, type);
                     if (sameChat(chatIdentity(getContext()), record.identity)) {
-                        await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, target.index, 'normal');
+                        await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, target.index, type);
                         await getContext().saveChat();
                     }
                 } catch { warn(record, '답장은 복구했지만 후처리 확장에서 오류가 났습니다.'); }

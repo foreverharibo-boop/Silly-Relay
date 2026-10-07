@@ -749,3 +749,107 @@ test('overlapping settlement and recovery display a durable reply once without r
     assert.equal(b.emitted.length, 0);
     assert.equal(fresh.recovery.list().length, 0);
 });
+
+function seedSwipes(b) {
+    const extra = { translation: '기존 번역', silly_relay: { id: 'a'.repeat(32), complete: true } };
+    b.disk.messages.push({ name: 'Character', is_user: false, is_system: false,
+        mes: '이전 후보 둘', send_date: '2026-10-07', extra: structuredClone(extra),
+        swipe_id: 1, swipes: ['이전 후보 하나', '이전 후보 둘'],
+        swipe_info: [{ send_date: '2026-10-06', extra: { reasoning: '예전 생각', translation: '첫 번역' } },
+            { send_date: '2026-10-07', extra }] });
+}
+function armSwipe(page) {
+    const last = page.ctx.chat.at(-1);
+    last.swipe_id = last.swipes.length;
+    page.recovery.generationStarted('swipe'); page.recovery.dataReady({}, false);
+}
+
+test('swipe JSON/SSE after full relaunch preserves all original candidates and adds exactly one reply', async t => {
+    for (const stream of [false, true]) {
+        const f = await fixture(t, { pageBytes: 7 }), b = await recoveryBrowser(t, f); seedSwipes(b);
+        const originals = structuredClone(b.disk.messages[1]);
+        const page = await b.makePage(); armSwipe(page); const jobId = id();
+        assert.equal(await page.recovery.prepare({ id: jobId, path: PATH, body: JSON.stringify({ type: 'swipe', stream }) }), true);
+        await f.start(jobId, { stream, duration: 40 }); page.recovery.stop();
+        const next = await b.makePage(); await next.recovery.recover();
+        const reply = b.disk.messages[1];
+        assert.equal(b.disk.messages.length, 2);
+        assert.deepEqual(reply.swipes.slice(0, 2), originals.swipes);
+        assert.deepEqual(reply.swipe_info.slice(0, 2), originals.swipe_info);
+        assert.equal(reply.swipes.length, 3); assert.equal(reply.swipe_id, 2);
+        assert.equal(reply.mes, stream ? '안녕 🤍' : '서버가 끝까지 받은 답장 🤍');
+        assert.equal(reply.swipe_info[2].extra[b.MARK].id, jobId);
+        assert.equal(reply.extra.translation, undefined);
+        assert.equal(reply.extra.reasoning, '');
+        assert.deepEqual(b.emitted.map(e => e.slice(1)), [[1, 'swipe'], [1, 'swipe']]);
+        await (await b.makePage()).recovery.recover();
+        assert.equal(b.disk.messages[1].swipes.length, 3);
+        assert.equal(f.calls.length, 1);
+        assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    }
+});
+
+test('partial swipe does not inherit completion of its previous candidate and recovers into its own slot', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f); seedSwipes(b);
+    const originals = structuredClone(b.disk.messages[1]);
+    const page = await b.makePage(); armSwipe(page); const jobId = id();
+    await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"swipe"}' });
+    await f.start(jobId, { duration: 20 });
+    const last = page.ctx.chat[1]; last.mes = '서버가 끝까'; last.swipes.push(last.mes);
+    last.swipe_info.push({ extra: structuredClone(last.extra) });
+    page.recovery.tag(1, false);
+    assert.equal(last.extra[b.MARK].complete, false);
+    await page.ctx.saveChat(); page.recovery.stop();
+    const next = await b.makePage(); await next.recovery.recover();
+    assert.equal(b.disk.messages[1].swipes.length, 3);
+    assert.deepEqual(b.disk.messages[1].swipe_info.slice(0, 2), originals.swipe_info);
+    assert.equal(b.disk.messages[1].swipes[2], '서버가 끝까지 받은 답장 🤍');
+    assert.equal(f.calls.length, 1);
+});
+
+test('swipe recovery refuses edited candidates, unsaved edits, another new candidate and changed history', async t => {
+    for (const mode of ['candidate', 'unsaved-edit', 'new-candidate', 'history', 'new-message']) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f); seedSwipes(b);
+        const page = await b.makePage(); armSwipe(page); const jobId = id();
+        await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"swipe"}' });
+        await f.start(jobId, { duration: 10 }); page.recovery.stop();
+        const last = b.disk.messages[1];
+        if (mode === 'candidate') last.swipes[0] = '수정된 첫 후보';
+        if (mode === 'new-candidate') { last.swipes.push('다른 요청의 답장'); last.mes = '다른 요청의 답장'; last.swipe_id = 2; }
+        if (mode === 'history') b.disk.messages[0].mes = '수정된 기록';
+        if (mode === 'new-message') b.disk.messages.push({ name: 'User', is_user: true, mes: '새 메시지' });
+        const before = JSON.stringify(b.disk.messages), next = await b.makePage();
+        if (mode === 'unsaved-edit') next.ctx.chat[1].mes = '아직 저장 안 된 수정';
+        const screen = JSON.stringify(next.ctx.chat);
+        await next.recovery.recover();
+        assert.equal(JSON.stringify(b.disk.messages), before, mode);
+        assert.equal(JSON.stringify(next.ctx.chat), screen, mode);
+        assert.equal(b.rendered.length, 0, mode);
+        assert.equal(f.calls.length, 1, mode);
+    }
+});
+
+test('failed swipe save retries without losing candidates or adding a duplicate slot', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f); seedSwipes(b);
+    const page = await b.makePage(); armSwipe(page); const jobId = id();
+    await page.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"swipe"}' });
+    await f.start(jobId, { duration: 10 }); page.recovery.stop();
+    const next = await b.makePage(); b.disk.failSave = true; await next.recovery.recover();
+    assert.equal(next.ctx.chat[1].swipes.length, 3); assert.equal(b.disk.messages[1].swipes.length, 2);
+    b.disk.failSave = false; await next.recovery.recover();
+    assert.equal(b.disk.messages[1].swipes.length, 3);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+});
+
+test('live swipe is acknowledged after saving even when another candidate is selected', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f); seedSwipes(b);
+    const page = await b.makePage(); armSwipe(page);
+    const response = await page.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"type":"swipe","duration":10}' });
+    const jobId = response.headers.get('x-silly-relay-job'), data = await response.json();
+    const message = page.ctx.chat[1]; message.mes = data.choices[0].message.content;
+    message.swipes.push(message.mes); message.swipe_info.push({ extra: {} }); page.recovery.tag(1, true);
+    message.swipe_id = 0; message.mes = message.swipes[0]; message.extra = structuredClone(message.swipe_info[0].extra);
+    await page.ctx.saveChat(); await page.recovery.settle();
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.equal(page.ctx.chat[1].swipe_id, 0); assert.equal(b.rendered.length, 0);
+});
