@@ -1,10 +1,18 @@
 # Silly Relay · 연결 유지 시험판
 
-버전 **0.1.0-test.3** · 별도 서버 플러그인 + 웹 확장 · AGPL-3.0-or-later
+버전 **0.1.0-test.4** · 별도 서버 플러그인 + 웹 확장 · AGPL-3.0-or-later
 
 아이폰에서 실리태번으로 생성 요청을 보낸 뒤 다른 앱으로 이동해도, 서버가 그 요청을 계속 처리하고, 돌아온 브라우저에 응답을 이어서 전달하도록 만든 시험판입니다. **실리팝 없이 단독으로 사용합니다.** 아이폰 알림 기능은 아직 없습니다.
 
 보관함 없이 연결 유지와 자동 이어받기에 집중합니다. **test.3부터 새로고침 후 원래 채팅으로 답장을 복구합니다.**
+
+## test.4 긴급 수정
+
+복구 준비 오류가 원래 답변 생성까지 중단시키던 경로를 수정했습니다. 생성 직전에 채팅을 다시 강제 저장하고 전체 내용을 읽어 비교하던 과정을 제거했습니다. 복구 연결 정보를 기록하지 못하면 이번 요청은 새로고침 복구 없이 진행한다고 알리고, 기존 서버 연결 유지 요청을 한 번만 보냅니다. 사용자가 누른 생성 중지는 그대로 적용합니다.
+
+복구할 때 원래 채팅인지 확인하는 검사와 채팅 저장 후 응답을 정리하는 검사는 유지합니다. 복구용 이벤트 처리 오류도 실리태번의 일반 생성 흐름으로 전파하지 않습니다.
+
+**서버가 test.3이면 이번 수정은 확장만 업데이트하고 페이지를 새로고침해도 적용됩니다.** 확장 제목에 `0.1.0-test.4`가 표시되는지 확인하세요. 서버 test.3과 test.4 모두 호환됩니다.
 
 ## test.3 업데이트
 
@@ -22,7 +30,7 @@
 git -C ~/SillyTavern/plugins/Silly-Relay pull --ff-only
 ```
 
-PC는 실제 실리태번 설치 폴더의 `plugins/Silly-Relay`에서 `git pull --ff-only`를 실행하면 됩니다. 연결 확인에 서버 `0.1.0-test.3`, 확장 제목 옆에도 `0.1.0-test.3`이 표시되는지 확인하세요.
+PC는 실제 실리태번 설치 폴더의 `plugins/Silly-Relay`에서 `git pull --ff-only`를 실행하면 됩니다. 새 설치는 서버와 확장이 `0.1.0-test.4`로 표시됩니다. 기존 서버 `0.1.0-test.3`도 확장 test.4와 호환됩니다.
 
 ## 먼저 알아둘 범위
 
@@ -58,7 +66,7 @@ grep -n '^enableServerPlugins:' ~/SillyTavern/config.yaml
 
 `false`라면 `nano ~/SillyTavern/config.yaml`로 열어 그 값을 `true`로 바꾸고 저장합니다. 같은 항목을 맨 아래에 추가하지 마세요.
 
-**3. 기존 실리 서버를 완전히 종료하고 평소 방법으로 다시 실행합니다.** 시작 로그에 `[Silly Relay] 0.1.0-test.3 loaded`가 나오면 서버 플러그인이 로딩된 것입니다. 브라우저만 닫았다 여는 것으로는 적용되지 않습니다.
+**3. 기존 실리 서버를 완전히 종료하고 평소 방법으로 다시 실행합니다.** 시작 로그에 `[Silly Relay] 0.1.0-test.4 loaded`가 나오면 서버 플러그인이 로딩된 것입니다. 브라우저만 닫았다 여는 것으로는 적용되지 않습니다.
 
 **4. 아이폰에서 평소 쓰는 주소로 같은 실리태번 서버에 접속합니다.** 실리책방에 접속했던 서버와 같은 서버이며, 실리태번 본화면을 열면 됩니다. 서버 폰과 아이폰의 기존 Tailscale 연결도 켜 두세요.
 
@@ -68,7 +76,7 @@ grep -n '^enableServerPlugins:' ~/SillyTavern/config.yaml
 https://github.com/foreverharibo-boop/Silly-Relay
 ```
 
-**6. 실리 페이지를 새로고침한 뒤 확장 설정의 `Silly Relay · 연결 유지 시험판`을 엽니다.** `연결 확인`을 눌러 `서버 0.1.0-test.3 연결됨`을 확인하고 `연결 유지 시험 기능`을 켭니다. 이 스위치는 현재 브라우저에만 적용되므로 아이폰에서 켜 주세요.
+**6. 실리 페이지를 새로고침한 뒤 확장 설정의 `Silly Relay · 연결 유지 시험판`을 엽니다.** `연결 확인`을 눌러 `서버 0.1.0-test.4 연결됨`을 확인하고 `연결 유지 시험 기능`을 켭니다. 이 스위치는 현재 브라우저에만 적용되므로 아이폰에서 켜 주세요.
 
 **7. 아래 아이폰 테스트 순서로 확인합니다.** APK 설치나 실리팝 연결 키 입력은 필요하지 않습니다.
 
@@ -80,7 +88,7 @@ ZIP 시험판을 이미 수동 설치했다면 같은 이름의 폴더가 있어
 
 ```bash
 pkg install unzip
-unzip -n ~/storage/downloads/Silly-Relay-v0.1.0-test.3.zip -d ~/silly-relay-test
+unzip -n ~/storage/downloads/Silly-Relay-v0.1.0-test.4.zip -d ~/silly-relay-test
 bash ~/silly-relay-test/silly-relay/install.sh ~/SillyTavern
 ```
 
@@ -97,7 +105,7 @@ bash ~/silly-relay-test/silly-relay/install.sh ~/SillyTavern default-user
 1. 실리태번의 `plugins/Silly-Relay` 폴더를 새로 만들고, 압축 안의 `package.json`, `LICENSE`, `server` 폴더를 넣습니다.
 2. **접속할 실리태번 계정**의 `data/<사용자핸들>/extensions/Silly-Relay` 폴더를 새로 만들고 `manifest.json`, `index.js`, `transport.mjs`, `recovery.mjs`, `style.css`, `LICENSE`를 넣습니다.
 3. 실제 사용하는 `config.yaml`의 기존 항목이 `enableServerPlugins: true`인지 확인합니다.
-4. 실리태번 서버를 완전히 종료한 뒤 다시 시작합니다. 로그의 `[Silly Relay] 0.1.0-test.3 loaded`를 확인합니다.
+4. 실리태번 서버를 완전히 종료한 뒤 다시 시작합니다. 로그의 `[Silly Relay] 0.1.0-test.4 loaded`를 확인합니다.
 5. 아이폰에서 평소 쓰던 주소로 같은 실리 서버에 접속한 뒤 페이지를 새로고침합니다.
 6. 확장 설정의 **Silly Relay → 연결 확인**을 눌러 서버 연결을 확인하고 **연결 유지 시험 기능**을 켭니다. 켜짐 상태는 그 브라우저에만 저장됩니다.
 

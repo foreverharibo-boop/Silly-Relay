@@ -1,7 +1,7 @@
-import { createTransport } from './transport.mjs';
-import { createRecovery } from './recovery.mjs';
+import { createTransport } from './transport.mjs?v=0.1.0-test.4';
+import { createRecovery } from './recovery.mjs?v=0.1.0-test.4';
 
-const VERSION = '0.1.0-test.3';
+const VERSION = '0.1.0-test.4';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -38,15 +38,16 @@ function notify(message) {
     else console.warn('[Silly Relay]', message);
 }
 function onEvent(type, data) {
-    recovery?.event(type, data);
+    try { recovery?.event(type, data); } catch { /* Recovery cannot cancel the live request. */ }
     const names = { starting: '서버로 요청 전달 중', accepted: '서버에서 생성 중 · 화면을 나가도 수신 계속',
         reconnecting: '연결 재시도 중 · 서버 작업은 유지됩니다',
         completed: '응답 전달 완료', cancelled: '서버 생성 중지 완료',
-        'cancel-pending': '중지 전달 대기 · 연결 복구 후 다시 보냅니다', error: '요청 오류' };
+        'cancel-pending': '중지 전달 대기 · 연결 복구 후 다시 보냅니다', error: '요청 오류',
+        'recovery-unavailable': '이번 요청은 새로고침 복구 없이 진행합니다' };
     lastEvent = `${names[type] || type}${data.message ? `: ${data.message}` : ''}`;
     if (type === 'accepted') lastEvent += data.reloadRecovery ? ' · 새로고침 복구 준비됨' : ' · 이 요청은 새로고침 복구 대상 아님';
     update();
-    if (type === 'error' || type === 'cancel-pending') notify(lastEvent);
+    if (['error', 'cancel-pending', 'recovery-unavailable'].includes(type)) notify(lastEvent);
 }
 async function flushCancellations() {
     for (const id of cancellations()) {
@@ -131,7 +132,15 @@ function initialize() {
     globalThis.addEventListener('pageshow', resume);
     const ctx = context();
     if (ctx?.eventSource && ctx.eventTypes) {
-        const on = (name, handler) => { if (ctx.eventTypes[name]) ctx.eventSource.on(ctx.eventTypes[name], handler); };
+        const on = (name, handler) => {
+            if (!ctx.eventTypes[name]) return;
+            ctx.eventSource.on(ctx.eventTypes[name], (...args) => {
+                try {
+                    const result = handler(...args);
+                    if (result?.catch) return result.catch(() => notify('복구 상태 처리에 실패했습니다. 답변 생성은 계속 진행합니다.'));
+                } catch { notify('복구 상태 처리에 실패했습니다. 답변 생성은 계속 진행합니다.'); }
+            });
+        };
         on('GENERATION_STARTED', recovery.generationStarted);
         on('GENERATE_AFTER_DATA', recovery.dataReady);
         on('GENERATION_ENDED', recovery.generationEnded);

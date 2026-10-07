@@ -471,3 +471,67 @@ test('failed upstream and expired jobs leave no automatic retry or fabricated ch
         assert.ok(b.messages.length > 0);
     }
 });
+
+test('recovery preflight failure cannot cancel or duplicate the original generation', async t => {
+    const { createTransport } = await import('../transport.mjs');
+    for (const reason of ['server capability check failed', 'QuotaExceededError', 'chat read-back failed']) {
+        const f = await fixture(t); const events = [];
+        const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+            prepareRecovery: async () => { throw new Error(reason); },
+            onEvent: (type, data) => events.push({ type, data }) });
+        const body = JSON.stringify({ type: 'normal', messages: [{ role: 'user', content: '그대로 보내기' }], duration: 10 });
+        const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body });
+        assert.equal((await response.json()).choices[0].message.content, '서버가 끝까지 받은 답장 🤍');
+        assert.equal(f.calls.length, 1);
+        assert.deepEqual(f.calls[0].body, JSON.parse(body));
+        assert.equal(f.calls[0].cancelled, false);
+        assert.equal(events.filter(e => e.type === 'recovery-unavailable').length, 1);
+        assert.equal(events.find(e => e.type === 'accepted').data.reloadRecovery, false);
+        assert.equal(events.some(e => e.type === 'cancelled'), false);
+    }
+});
+
+test('recovery preparation never force-saves or reads the chat before starting generation', async t => {
+    const f = await fixture(t); const b = await recoveryBrowser(t, f); const p = await b.makePage();
+    const controller = new AbortController();
+    let forcedSaves = 0;
+    p.ctx.saveChat = async () => { forcedSaves++; controller.abort(); throw new Error('save would interfere with generation'); };
+    p.arm();
+    const response = await p.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: '{"type":"normal","duration":10}', signal: controller.signal });
+    assert.ok((await response.json()).choices[0].message.content);
+    assert.equal(forcedSaves, 0);
+    assert.equal(controller.signal.aborted, false);
+    assert.equal(p.recovery.list().length, 1);
+    assert.equal(f.calls.length, 1);
+});
+
+test('storage denial degrades recovery without preventing the reply', async t => {
+    const f = await fixture(t);
+    const { createRecovery } = await import('../recovery.mjs');
+    const { createTransport } = await import('../transport.mjs');
+    const ctx = { chat: [{ name: 'User', is_user: true, mes: 'Hi' }], characters: [{ avatar: 'Char.png' }],
+        characterId: 0, chatId: 'Chat', name2: 'Character' };
+    const events = []; let recovery;
+    const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+        prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => events.push({ type, data }) });
+    recovery = createRecovery({ getContext: () => ctx, api: transport.api,
+        fetchImpl: () => { throw new Error('Must not read chat on generation path'); }, getHeaders: () => AUTH,
+        storage: { getItem: () => null, setItem: () => { throw new DOMException('Storage full', 'QuotaExceededError'); } }, tabId: 'tab' });
+    t.after(() => recovery.stop()); recovery.generationStarted('normal'); recovery.dataReady({}, false);
+    const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"type":"normal","duration":10}' });
+    assert.ok((await response.json()).choices[0].message.content);
+    assert.equal(recovery.list().length, 0);
+    assert.equal(f.calls.length, 1);
+    assert.equal(events.find(e => e.type === 'accepted').data.reloadRecovery, false);
+});
+
+test('explicit abort during failed optional preparation still prevents the AI request', async t => {
+    const f = await fixture(t); const { createTransport } = await import('../transport.mjs');
+    const controller = new AbortController();
+    const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+        prepareRecovery: async () => { controller.abort(); throw new Error('optional failure'); } });
+    await assert.rejects(transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: '{"type":"normal"}', signal: controller.signal }), { name: 'AbortError' });
+    assert.equal(f.calls.length, 0);
+});

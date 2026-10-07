@@ -60,7 +60,13 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         const id = newId();
         // Persist the binding BEFORE submitting a billable request. Recoverable replies
         // are acknowledged by the chat layer only after the saved message is verified.
-        const retainForRecovery = await prepareRecovery({ id, path: url.pathname, body });
+        let retainForRecovery = false;
+        try { retainForRecovery = await prepareRecovery({ id, path: url.pathname, body }); }
+        catch (error) {
+            // Recovery is optional. A failed journal/capability check must never
+            // suppress the one original AI request or retry it by another route.
+            emit('recovery-unavailable', { id, message: error.message || '복구 준비 실패' });
+        }
         if (signal?.aborted) { emit('cancelled', { id }); throw abortError(); }
         let stopped = false;
         let detached = false;

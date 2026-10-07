@@ -172,22 +172,27 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             name: ctx.name2, created: Date.now(), stream: !!data.stream, mainApi: 'openai',
             source: data.chat_completion_source || ctx.chatCompletionSettings?.chat_completion_source,
             model: typeof data.model === 'string' ? data.model : '', bytes: null };
-        // Checkpoint the user's last message so a reload cannot lose the insertion anchor.
-        await ctx.saveChat();
-        if (!sameChat(chatIdentity(getContext()), identity) || fingerprint(getContext().chat) !== record.anchor) {
-            throw new Error('생성 준비 중 채팅이 바뀌었습니다. 현재 채팅에서 다시 요청해 주세요.');
+        // ST already saves a normal user message before generating. Do not call
+        // saveChat or read the entire chat on this critical path: a delayed save,
+        // older file header or other extension must not block answer generation.
+        // The strict disk/chat checks still run before recovery writes and ACKs.
+        try {
+            change(id, record);
+            if (!list().some(r => r.id === id)) throw new Error('브라우저에 복구 정보를 기록하지 못했습니다.');
+        } catch (error) {
+            try { change(id, null); } catch { /* Storage may be unavailable. */ }
+            throw error;
         }
-        const saved = await diskChat(record);
-        if (fingerprint(saved) !== record.anchor) throw new Error('채팅 저장을 확인하지 못해 생성을 시작하지 않았습니다. 연결을 확인해 주세요.');
-        change(id, record);
-        if (!list().some(r => r.id === id)) throw new Error('브라우저에 복구 정보를 기록하지 못했습니다.');
         live.add(id);
         return true;
     }
     function event(type, data) {
         const record = list().find(r => r.id === data.id);
         if (!record) return;
-        if (type === 'completed') {
+        if (type === 'recovery-unavailable') {
+            live.delete(record.id);
+            try { change(record.id, null); } catch { /* Storage may be unavailable. */ }
+        } else if (type === 'completed') {
             if (data.status < 200 || data.status >= 300) { change(record.id, null); live.delete(record.id); return; }
             change(record.id, { ...record, bytes: data.bytes });
             // Don't let the stream read EOF delete data before ST saves the chat.
