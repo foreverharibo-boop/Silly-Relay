@@ -78,20 +78,21 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
 
 export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage, tabId,
     formatReply = async text => text, parser = async () => ({}), notify = () => {},
-    isVisible = () => true }) {
+    isVisible = () => true, allowPreviousSession = false }) {
     let owner = null, ticket = null, generating = false, busy = false;
     const live = new Set();
     const warned = new Set();
     let stopped = false;
     const storageKey = () => `${KEY}:${owner}`;
-    function list() {
+    function allRecords() {
         if (!owner) return [];
         try {
             const value = JSON.parse(storage.getItem(storageKey()) || '[]');
-            return Array.isArray(value) ? value.filter(r => VALID_ID.test(r.id) && r.tab === tabId
+            return Array.isArray(value) ? value.filter(r => r && VALID_ID.test(r.id)
                 && r.identity && Number.isInteger(r.count) && r.count >= 0 && Date.now() - r.created < MAX_AGE) : [];
         } catch { return []; }
     }
+    function list() { return allRecords().filter(r => r.tab === tabId); }
     function change(id, value) {
         let all;
         try { all = JSON.parse(storage.getItem(storageKey()) || '[]'); } catch { all = []; }
@@ -305,7 +306,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             // A previous save failed but the in-memory restored message is still present.
             await ctx.saveChat();
         }
-        if (await acknowledge(record)) notify('새로고침 전에 받던 답장을 원래 채팅에 복구했어요.', true);
+        if (await acknowledge(record)) notify('다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
         return true;
     }
     async function recover() {
@@ -334,6 +335,48 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         } catch (error) { warn(null, error.message); }
         finally { busy = false; }
     }
+    // Explicit migration for pre-test.6 PWA sessions only. Never automatically
+    // take a request from an unrelated browser tab. All normal chat/disk guards
+    // remain in force; this only repairs the old session binding, not chat data.
+    async function recoverPreviousSession() {
+        if (!allowPreviousSession || !tabId) return;
+        if (busy || generating || stopped || !isVisible()) {
+            notify('답장 생성이나 복구가 끝난 뒤 원래 채팅에서 다시 눌러 주세요.');
+            return;
+        }
+        let adopted = false;
+        busy = true;
+        try {
+            await identify();
+            const identity = chatIdentity(getContext());
+            if (!identity) throw new Error('답장을 기다리던 1:1 채팅을 먼저 열어 주세요.');
+            const candidates = allRecords().filter(r => r.tab !== tabId && sameChat(r.identity, identity));
+            if (!candidates.length) {
+                notify('이전 실행의 대기 기록이 없어요. 기록이 삭제됐거나 이 요청이 복구 대상으로 접수되지 않았을 수 있어요.');
+                return;
+            }
+            if (candidates.length !== 1) throw new Error('이 채팅의 이전 대기 요청이 여러 개라 자동으로 고르지 않았어요.');
+            const record = candidates[0];
+            const saved = await diskChat(record);
+            if (!position(record, saved) || !position(record, getContext().chat)) {
+                throw new Error('원래 채팅과 현재 내용이 달라 복구를 멈췄어요. 기존 메시지는 변경하지 않았어요.');
+            }
+            const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
+            if (info.state === 'running') throw new Error('서버에서 아직 답장을 받고 있어요. 완료된 뒤 다시 눌러 주세요.');
+            if (info.state !== 'completed' || info.status < 200 || info.status >= 300) {
+                throw new Error('서버에 복구할 완료 답장이 없어요.');
+            }
+            // The user can change chats or start a generation during these reads.
+            if (generating || stopped || !isVisible() || !sameChat(chatIdentity(getContext()), identity)
+                || !position(record, getContext().chat)) return;
+            change(record.id, { ...record, tab: tabId, bytes: info.bytes });
+            adopted = true;
+        } catch (error) {
+            if ([404, 410].includes(error.httpStatus)) notify('서버에 이 답장이 남아 있지 않아요. 서버 재시작·응답 만료·이미 전달된 요청일 수 있어요.');
+            else notify(error.message);
+        } finally { busy = false; }
+        if (adopted) await recover();
+    }
     function generationEnded() {
         generating = false; ticket = null;
         setTimeout(() => { if (!stopped) void settle(); }, 500);
@@ -346,5 +389,5 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
     }
     function stop() { stopped = true; }
-    return { prepare, event, tag, generationStarted, dataReady, generationEnded, generationStopped, recover, settle, stop, list };
+    return { prepare, event, tag, generationStarted, dataReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }

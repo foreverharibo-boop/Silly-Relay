@@ -297,7 +297,7 @@ async function recoveryBrowser(t, f) {
     const storage = { getItem: key => storageMap.get(key) || null, setItem: (key, value) => storageMap.set(key, value) };
     const disk = { messages: [{ name: 'User', is_user: true, mes: '안녕', send_date: '2026-10-07' }], failSave: false };
     const messages = [], rendered = [], emitted = [];
-    async function makePage(tabId = 'same-tab') {
+    async function makePage(tabId = 'same-tab', options = {}) {
         const ctx = { chat: copy(disk.messages), characters: [{ avatar: 'Char.png' }], characterId: 0,
             chatId: 'Chat A', name2: 'Character', groupId: null, chatCompletionSettings: { chat_completion_source: 'custom' },
             eventTypes: { MESSAGE_RECEIVED: 'received', CHARACTER_MESSAGE_RENDERED: 'rendered' },
@@ -312,7 +312,7 @@ async function recoveryBrowser(t, f) {
         const transport = createTransport({ fetchImpl: request, origin: f.base, enabled: () => true,
             prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => recovery.event(type, data) });
         recovery = createRecovery({ getContext: () => ctx, api: transport.api, fetchImpl: request,
-            getHeaders: () => AUTH, storage, tabId, notify: text => messages.push(text) });
+            getHeaders: () => AUTH, storage, tabId, ...options, notify: text => messages.push(text) });
         t.after(() => recovery.stop());
         const arm = () => { recovery.generationStarted('normal'); recovery.dataReady({}, false); };
         return { ctx, recovery, transport, arm };
@@ -590,4 +590,60 @@ test('explicit abort during failed optional preparation still prevents the AI re
     await assert.rejects(transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
         body: '{"type":"normal"}', signal: controller.signal }), { name: 'AbortError' });
     assert.equal(f.calls.length, 0);
+});
+
+test('full PWA relaunch with lost session storage restores JSON/SSE once without another AI request', async t => {
+    const { recoveryIdentity } = await import('../identity.mjs');
+    const memory = () => { const m = new Map(); return { getItem: k => m.get(k) || null, setItem: (k,v) => m.set(k,v) }; };
+    for (const stream of [false, true]) {
+        const local = memory();
+        const oldId = recoveryIdentity({ local, session: memory(), standalone: true, newId: id });
+        const f = await fixture(t), b = await recoveryBrowser(t, f);
+        const page = await b.makePage(oldId); page.arm(); const jobId = id();
+        await page.recovery.prepare({ id: jobId, path: PATH, body: JSON.stringify({ type: 'normal', stream, include_reasoning: false }) });
+        await f.start(jobId, { stream, duration: 60 }); page.recovery.stop();
+        const restartedId = recoveryIdentity({ local, session: memory(), standalone: true, newId: id });
+        const next = await b.makePage(restartedId);
+        next.ctx.chatId = undefined; // Login/lock screen has no selected chat yet.
+        await next.recovery.recover(); assert.equal(b.disk.messages.length, 1);
+        next.ctx.chatId = 'Chat A'; await next.recovery.recover();
+        assert.equal(b.disk.messages.length, 2);
+        assert.equal(b.disk.messages[1].extra[b.MARK].recovered, true);
+        assert.equal(b.disk.messages[1].extra.reasoning, '');
+        await (await b.makePage(restartedId)).recovery.recover();
+        assert.equal(b.disk.messages.length, 2); assert.equal(f.calls.length, 1);
+    }
+});
+
+test('explicit legacy PWA recovery migrates one old session but never another browser tab automatically', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage('old-session'); old.arm(); const jobId = id();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); old.recovery.stop(); await delay(25);
+    const ordinary = await b.makePage('browser-tab');
+    await ordinary.recovery.recoverPreviousSession(); await ordinary.recovery.recover();
+    assert.equal(b.disk.messages.length, 1);
+    const app = await b.makePage('persistent-app', { allowPreviousSession: true });
+    await app.recovery.recover(); assert.equal(b.disk.messages.length, 1);
+    await app.recovery.recoverPreviousSession();
+    assert.equal(b.disk.messages.length, 2); assert.equal(b.disk.messages[1].extra[b.MARK].id, jobId);
+    await app.recovery.recoverPreviousSession(); assert.equal(b.disk.messages.length, 2);
+    assert.equal(f.calls.length, 1);
+});
+
+test('legacy lookup refuses changed history, wrong chat, multiple candidates and expired server result', async t => {
+    for (const mode of ['changed', 'wrong', 'multiple', 'expired']) {
+        const f = await fixture(t, mode === 'expired' ? { retentionMs: 15 } : {}), b = await recoveryBrowser(t, f);
+        const old = await b.makePage('old-session'); old.arm(); const jobId = id();
+        await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        if (mode === 'multiple') { old.arm(); await old.recovery.prepare({ id: id(), path: PATH, body: '{"type":"normal"}' }); }
+        await f.start(jobId, { duration: 10 }); old.recovery.stop(); await delay(mode === 'expired' ? 70 : 25);
+        if (mode === 'changed') b.disk.messages[0].mes = '수정한 내용';
+        const app = await b.makePage('new-app', { allowPreviousSession: true });
+        if (mode === 'wrong') app.ctx.chatId = 'Other Chat';
+        await app.recovery.recoverPreviousSession();
+        assert.equal(b.disk.messages.length, 1, mode);
+        assert.equal(f.calls.length, 1, mode);
+        assert.ok(b.messages.length > 0, mode);
+    }
 });

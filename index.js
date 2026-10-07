@@ -1,7 +1,8 @@
-import { createTransport } from './transport.mjs?v=0.1.0-test.5';
-import { createRecovery } from './recovery.mjs?v=0.1.0-test.5';
+import { createTransport } from './transport.mjs?v=0.1.0-test.6';
+import { createRecovery } from './recovery.mjs?v=0.1.0-test.6';
+import { recoveryIdentity } from './identity.mjs?v=0.1.0-test.6';
 
-const VERSION = '0.1.0-test.5';
+const VERSION = '0.1.0-test.6';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -45,7 +46,7 @@ function onEvent(type, data) {
         'cancel-pending': '중지 전달 대기 · 연결 복구 후 다시 보냅니다', error: '요청 오류',
         'recovery-unavailable': '이번 요청은 새로고침 복구 없이 진행합니다' };
     lastEvent = `${names[type] || type}${data.message ? `: ${data.message}` : ''}`;
-    if (type === 'accepted') lastEvent += data.reloadRecovery ? ' · 새로고침 복구 준비됨' : ' · 이 요청은 새로고침 복구 대상 아님';
+    if (type === 'accepted') lastEvent += data.reloadRecovery ? ' · 재접속 복구 준비됨' : ' · 이 요청은 새로고침 복구 대상 아님';
     update();
     if (['error', 'cancel-pending', 'recovery-unavailable'].includes(type)) notify(lastEvent);
 }
@@ -78,20 +79,20 @@ function initialize() {
     const originalFetch = globalThis.fetch.bind(globalThis);
     let tabId;
     let recoveryStorage;
+    const standalone = navigator.standalone === true || globalThis.matchMedia?.('(display-mode: standalone)').matches === true;
     try {
         recoveryStorage = globalThis.localStorage;
-        tabId = sessionStorage.getItem('silly-relay-tab');
-        if (!tabId) {
+        tabId = recoveryIdentity({ local: recoveryStorage, session: globalThis.sessionStorage, standalone, newId: () => {
             const bytes = crypto.getRandomValues(new Uint8Array(16));
-            tabId = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-            sessionStorage.setItem('silly-relay-tab', tabId);
-        }
+            return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        } });
     } catch { tabId = null; recoveryStorage = { getItem: () => null, setItem: () => {} }; }
     transport = createTransport({ fetchImpl: originalFetch, origin: location.href,
         enabled: () => active, onEvent, saveCancellation,
         prepareRecovery: data => tabId ? recovery.prepare(data) : Promise.resolve(false) });
     recovery = createRecovery({ getContext: context, api: transport.api, fetchImpl: originalFetch,
         getHeaders: headers, storage: recoveryStorage, tabId,
+        allowPreviousSession: standalone,
         isVisible: () => active && document.visibilityState !== 'hidden',
         parser: async () => ({ extract: context().extractMessageFromData,
             streamChunk: (await import('/scripts/openai.js')).getStreamingReply }),
@@ -114,7 +115,8 @@ function initialize() {
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
             <p data-status></p><small data-last></small>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
-            <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침 후 같은 채팅을 열면 일반 답장을 자동 복구합니다. 현재 복구 대상은 1:1 채팅의 Chat Completion 일반 답변·재생성입니다.</small>
+            <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>이전 실행 답장 찾기</button></div>
+            <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침하거나 홈 화면 웹앱을 다시 실행한 뒤 같은 채팅을 열면 일반 답장을 자동 복구합니다. 현재 복구 대상은 1:1 채팅의 Chat Completion 일반 답변·재생성입니다.</small>
         </div></div>`;
     const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
     if (container) container.append(panel);
@@ -126,6 +128,15 @@ function initialize() {
         else { state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
     });
     panel.querySelector('[data-check]').addEventListener('click', check);
+    panel.querySelector('[data-previous-panel]').hidden = !standalone;
+    panel.querySelector('[data-previous]').addEventListener('click', async event => {
+        if (!active) { notify('연결 유지 시험 기능을 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
+        const button = event.currentTarget;
+        button.disabled = true;
+        try { await recovery.recoverPreviousSession(); }
+        catch (error) { notify(error.message); }
+        finally { button.disabled = false; }
+    });
     function resume() { void flushCancellations(); if (active && tabId) void recovery.recover(); }
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resume(); });
     globalThis.addEventListener('online', resume);

@@ -36,7 +36,7 @@ mkdir -p -- "$st_root/plugins"
 mkdir -- "$plugin_dest" "$extension_dest"
 cp -- "$relay_source/package.json" "$relay_source/LICENSE" "$plugin_dest/"
 cp -R -- "$relay_source/server" "$plugin_dest/server"
-for relay_file in manifest.json index.js transport.mjs recovery.mjs style.css LICENSE; do
+for relay_file in manifest.json index.js transport.mjs recovery.mjs identity.mjs style.css LICENSE; do
     cp -- "$relay_source/$relay_file" "$extension_dest/"
 done
 echo "Silly Relay 시험판 설치 완료"

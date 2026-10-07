@@ -1,6 +1,6 @@
 {
   "name": "silly-relay",
-  "version": "0.1.0-test.5",
+  "version": "0.1.0-test.6",
   "private": true,
   "description": "Experimental resumable generation transport for SillyTavern",
   "main": "server/index.cjs",
