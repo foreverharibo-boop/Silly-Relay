@@ -1,0 +1,103 @@
+import { createTransport } from './transport.mjs';
+
+const VERSION = '0.1.0-test.2';
+const ENABLE_KEY = 'silly-relay-enabled-v1';
+const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
+let active = false;
+let panel;
+let transport;
+let hook;
+let state = '연결 확인을 눌러 주세요.';
+let lastEvent = '아직 생성 요청이 없습니다.';
+let checking = false;
+const context = () => globalThis.SillyTavern?.getContext?.();
+const headers = () => context()?.getRequestHeaders?.() || { 'Content-Type': 'application/json' };
+function readStored(key, fallback) {
+    try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+}
+function writeStored(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Private browsing. */ } }
+function cancellations() {
+    const list = readStored(CANCEL_KEY, []);
+    return Array.isArray(list) ? list.filter(id => /^[a-f0-9]{32}$/.test(id)).slice(-64) : [];
+}
+function saveCancellation(id, pending) {
+    const ids = new Set(cancellations());
+    pending ? ids.add(id) : ids.delete(id);
+    writeStored(CANCEL_KEY, [...ids].slice(-64));
+}
+function update() {
+    if (!panel) return;
+    panel.querySelector('[data-status]').textContent = state;
+    panel.querySelector('[data-last]').textContent = lastEvent;
+    panel.querySelector('input').checked = active;
+}
+function notify(message) {
+    if (globalThis.toastr) globalThis.toastr.warning(message, 'Silly Relay');
+    else console.warn('[Silly Relay]', message);
+}
+function onEvent(type, data) {
+    const names = { starting: '서버로 요청 전달 중', accepted: '서버에서 생성 중 · 화면을 나가도 수신 계속',
+        reconnecting: '연결 재시도 중 · 서버 작업은 유지됩니다',
+        completed: '응답 전달 완료', cancelled: '서버 생성 중지 완료',
+        'cancel-pending': '중지 전달 대기 · 연결 복구 후 다시 보냅니다', error: '요청 오류' };
+    lastEvent = `${names[type] || type}${data.message ? `: ${data.message}` : ''}`;
+    update();
+    if (type === 'error' || type === 'cancel-pending') notify(lastEvent);
+}
+async function flushCancellations() {
+    for (const id of cancellations()) {
+        try {
+            await transport.api(`/jobs/${id}/cancel`, { method: 'POST', headers: headers(), body: '{}' });
+            saveCancellation(id, false);
+        } catch { break; }
+    }
+}
+async function check() {
+    if (checking) return;
+    checking = true;
+    try {
+        const result = await transport.api('/status', { headers: headers() });
+        if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 시험판을 사용할 수 없습니다.');
+        state = `서버 ${result.version} 연결됨`;
+        if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
+        await flushCancellations();
+    } catch (error) { state = `서버 연결 확인 실패: ${error.message}`; }
+    finally { checking = false; update(); }
+}
+
+function initialize() {
+    if (globalThis.fetch.__sillyRelay) return;
+    active = readStored(ENABLE_KEY, false) === true;
+    transport = createTransport({ fetchImpl: globalThis.fetch.bind(globalThis), origin: location.href,
+        enabled: () => active, onEvent, saveCancellation });
+    hook = transport.fetch;
+    globalThis.fetch = hook;
+    panel = document.createElement('div');
+    panel.id = 'silly-relay-settings';
+    panel.className = 'extension_container';
+    panel.innerHTML = `<div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header"><b>Silly Relay <small>${VERSION}</small></b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
+        <div class="inline-drawer-content">
+            <label class="checkbox_label"><input type="checkbox"><span>연결 유지 시험 기능</span></label>
+            <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
+            <p data-status></p><small data-last></small>
+            <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
+            <small>다른 앱으로 이동해도 서버 요청을 유지하고, 돌아오면 응답을 이어받습니다. 페이지 새로고침 후 자동 복구는 지원하지 않습니다.</small>
+        </div></div>`;
+    const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
+    if (container) container.append(panel);
+    else notify('설정 영역을 찾지 못했습니다. 실리태번 페이지를 새로고침해 주세요.');
+    panel.querySelector('input').addEventListener('change', event => {
+        active = event.target.checked;
+        writeStored(ENABLE_KEY, active);
+        if (active) void check();
+        else { state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
+    });
+    panel.querySelector('[data-check]').addEventListener('click', check);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void flushCancellations(); });
+    globalThis.addEventListener('online', () => void flushCancellations());
+    update();
+    if (active) void check();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
+else initialize();

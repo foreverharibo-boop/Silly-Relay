@@ -1,0 +1,4 @@
+#silly-relay-settings small { opacity: .75; }
+#silly-relay-settings p { margin: .5em 0; }
+#silly-relay-settings .sr-actions { display: flex; gap: 6px; margin: 8px 0; }
+#silly-relay-settings .menu_button { width: auto; padding: 4px 8px; margin: 0; font-size: .85em; }
