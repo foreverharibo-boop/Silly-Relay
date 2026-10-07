@@ -647,3 +647,105 @@ test('legacy lookup refuses changed history, wrong chat, multiple candidates and
         assert.ok(b.messages.length > 0, mode);
     }
 });
+
+test('saved reply is displayed on a stale relaunched page before its recovery record is removed', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage(); old.arm(); const jobId = id();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); await delay(25);
+    const fresh = await b.makePage(); // This page loaded before the old page finished saving.
+    old.ctx.chat.push({ name: 'Character', is_user: false, mes: '이미 저장된 답장', extra: {} });
+    old.recovery.tag(1, true); await old.ctx.saveChat(); old.recovery.stop();
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat[1]?.mes, '이미 저장된 답장');
+    assert.equal(b.rendered.length, 1);
+    assert.equal(b.emitted.length, 0, 'displaying a saved reply must not rerun extensions');
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.equal(f.calls.length, 1);
+});
+
+test('a saved reply remains displayable after transport ACK even without a recorded byte count', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage(); old.arm(); const jobId = id();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); await delay(25);
+    const fresh = await b.makePage();
+    old.ctx.chat.push({ name: 'Character', is_user: false, mes: '저장 완료된 답장', extra: {} });
+    old.recovery.tag(1, true); await old.ctx.saveChat(); old.recovery.stop();
+    const info = await f.get(jobId);
+    await f.request(`/jobs/${jobId}/ack`, { method: 'POST', body: JSON.stringify({ cursor: info.bytes }) });
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat[1]?.mes, '저장 완료된 답장');
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal(b.messages.some(m => /만료|재시작/.test(m)), false);
+    assert.equal(f.calls.length, 1);
+});
+
+test('a durable reply never replaces an edited or independently answered current screen', async t => {
+    for (const mode of ['edit', 'new-answer']) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f);
+        const old = await b.makePage(); old.arm(); const jobId = id();
+        await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        await f.start(jobId, { duration: 10 }); await delay(25);
+        const fresh = await b.makePage();
+        if (mode === 'edit') fresh.ctx.chat[0].mes = '화면에서 수정한 내용';
+        else fresh.ctx.chat.push({ name: 'Character', is_user: false, mes: '다른 답장' });
+        const before = JSON.stringify(fresh.ctx.chat);
+        old.ctx.chat.push({ name: 'Character', is_user: false, mes: '이미 저장된 답장', extra: {} });
+        old.recovery.tag(1, true); await old.ctx.saveChat(); old.recovery.stop();
+        const saved = JSON.stringify(b.disk.messages), info = await f.get(jobId);
+        await f.request(`/jobs/${jobId}/ack`, { method: 'POST', body: JSON.stringify({ cursor: info.bytes }) });
+        await fresh.recovery.recover();
+        assert.equal(JSON.stringify(fresh.ctx.chat), before);
+        assert.equal(JSON.stringify(b.disk.messages), saved);
+        assert.equal(fresh.recovery.list().length, 1, 'keep the receipt until the saved chat is actually opened');
+        assert.equal(b.rendered.length, 0);
+        assert.ok(b.messages.some(m => m.includes('현재 화면의 내용이 달라')));
+    }
+});
+
+test('legacy lookup displays a saved reply even after its server buffer has been acknowledged', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage('legacy'); old.arm(); const jobId = id();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); await delay(25);
+    const app = await b.makePage('persistent', { allowPreviousSession: true });
+    old.ctx.chat.push({ name: 'Character', is_user: false, mes: '이전 실행이 저장한 답장', extra: {} });
+    old.recovery.tag(1, true); await old.ctx.saveChat(); old.recovery.stop();
+    const info = await f.get(jobId);
+    await f.request(`/jobs/${jobId}/ack`, { method: 'POST', body: JSON.stringify({ cursor: info.bytes }) });
+    await app.recovery.recoverPreviousSession();
+    assert.equal(app.ctx.chat[1]?.mes, '이전 실행이 저장한 답장');
+    assert.equal(b.messages.some(m => /404|410|만료/.test(m)), false);
+    assert.equal(f.calls.length, 1);
+});
+
+test('manual lookup prefers the current pending reply over an unrelated expired legacy request', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage('legacy'); old.arm();
+    await old.recovery.prepare({ id: id(), path: PATH, body: '{"type":"normal"}' }); old.recovery.stop();
+    const app = await b.makePage('persistent', { allowPreviousSession: true }); app.arm(); const jobId = id();
+    await app.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); app.recovery.stop();
+    const fresh = await b.makePage('persistent', { allowPreviousSession: true });
+    await fresh.recovery.recoverPreviousSession();
+    assert.equal(fresh.ctx.chat[1]?.extra?.[b.MARK]?.id, jobId);
+    assert.equal(b.messages.some(m => /404|410|만료/.test(m)), false);
+    assert.equal(f.calls.length, 1);
+});
+
+test('overlapping settlement and recovery display a durable reply once without replaying message hooks', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    const old = await b.makePage(); old.arm(); const jobId = id();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { duration: 10 }); await delay(25);
+    const fresh = await b.makePage();
+    old.ctx.chat.push({ name: 'Character', is_user: false, mes: '저장된 답장', extra: {} });
+    old.recovery.tag(1, true); await old.ctx.saveChat(); old.recovery.stop();
+    await Promise.all([fresh.recovery.settle(), fresh.recovery.recover(), fresh.recovery.settle()]);
+    assert.equal(fresh.ctx.chat.length, 2);
+    assert.equal(b.rendered.length, 1);
+    assert.equal(b.emitted.length, 0);
+    assert.equal(fresh.recovery.list().length, 0);
+});

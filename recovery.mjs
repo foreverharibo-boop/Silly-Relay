@@ -82,6 +82,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     let owner = null, ticket = null, generating = false, busy = false;
     const live = new Set();
     const warned = new Set();
+    const receipts = new Map();
     let stopped = false;
     const storageKey = () => `${KEY}:${owner}`;
     function allRecords() {
@@ -140,12 +141,41 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
         return null;
     }
-    async function acknowledge(record) {
-        if (!Number.isSafeInteger(record.bytes)) return false;
+    function showSaved(record, saved) {
+        const ctx = getContext();
+        if (stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        const target = position(record, ctx.chat);
+        if (target?.done) return true;
+        if (generating) return false;
+        // A previous page may have saved just after this page loaded the chat.
+        // Display that exact durable message, without saving stale history back
+        // over the file or firing generation/translation hooks a second time.
+        if (!target || saved.length !== record.count + 1
+            || fingerprint(saved.slice(0, record.count)) !== record.anchor
+            || !saved[record.count]?.extra?.[MARK]?.complete
+            || saved[record.count].extra[MARK].id !== record.id) {
+            warn(record, '답장은 채팅 파일에 저장돼 있지만 현재 화면의 내용이 달라 자동으로 바꾸지 않았어요. 원래 채팅을 다시 열어 주세요.');
+            return false;
+        }
+        const message = JSON.parse(JSON.stringify(saved[record.count]));
+        const replacing = target.index < ctx.chat.length;
+        ctx.chat[target.index] = message;
+        ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
+        notify('채팅 파일에 저장된 답장을 화면에 불러왔어요.', true);
+        return true;
+    }
+    async function receipt(record) {
+        if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
         if (!saved.some(m => m.extra?.[MARK]?.id === record.id && m.extra[MARK].complete)) return false;
+        if (!showSaved(record, saved)) return false;
         try {
+            if (!Number.isSafeInteger(record.bytes)) {
+                const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
+                if (info.state !== 'completed') return false;
+                record = { ...record, bytes: info.bytes };
+            }
             await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
                 body: JSON.stringify({ cursor: record.bytes }) });
         } catch (error) {
@@ -154,6 +184,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         change(record.id, null);
         live.delete(record.id);
         return true;
+    }
+    async function acknowledge(record) {
+        if (receipts.has(record.id)) return receipts.get(record.id);
+        const pending = receipt(record);
+        receipts.set(record.id, pending);
+        try { return await pending; }
+        finally { receipts.delete(record.id); }
     }
     function generationStarted(type, options = {}, dryRun = false) {
         generating = !dryRun;
@@ -223,16 +260,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
     }
     async function settle() {
-        for (let record of list()) {
+        for (const record of list()) {
             try {
-                if (!Number.isSafeInteger(record.bytes)) {
-                    const ctx = getContext();
-                    // Some SSE consumers stop at [DONE] before pulling transport EOF.
-                    if (!sameChat(chatIdentity(ctx), record.identity) || !position(record, ctx.chat)?.done) continue;
-                    const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
-                    if (info.state !== 'completed') continue;
-                    record = { ...record, bytes: info.bytes }; change(record.id, record);
-                }
                 await acknowledge(record);
             } catch { /* Keep response until a verified save. */ }
         }
@@ -325,8 +354,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                     await apply(data.record, reply, data.finishedAt);
                 } catch (error) {
                     if ([404, 410].includes(error.httpStatus)) {
+                        // Another page/receipt may have ACKed while this read was
+                        // in flight. A saved reply is not a missing reply.
+                        if (await acknowledge(record)) continue;
+                        if (position(record, await diskChat(record))?.done) continue;
                         change(record.id, null);
-                        warn(record, '복구 응답이 만료됐거나 서버가 재시작되어 이 답장을 복구할 수 없습니다.');
+                        warn(record, error.httpStatus === 410
+                            ? `요청 ${record.id.slice(0, 8)}: 서버는 전달 완료로 표시하지만 채팅 저장을 확인하지 못했어요.`
+                            : `요청 ${record.id.slice(0, 8)}: 서버에서 이 요청을 찾지 못했어요 (HTTP 404). 원인은 아직 확인되지 않았어요.`);
                     } else if (!(error instanceof TypeError || ['TimeoutError', 'AbortError'].includes(error.name))) {
                         warn(record, error.message);
                     }
@@ -344,7 +379,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             notify('답장 생성이나 복구가 끝난 뒤 원래 채팅에서 다시 눌러 주세요.');
             return;
         }
+        await identify();
+        if (list().some(r => sameChat(r.identity, chatIdentity(getContext())))) {
+            // Prefer this installation's current reply over stale legacy IDs.
+            await recover();
+            return;
+        }
         let adopted = false;
+        let record;
         busy = true;
         try {
             await identify();
@@ -356,11 +398,12 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 return;
             }
             if (candidates.length !== 1) throw new Error('이 채팅의 이전 대기 요청이 여러 개라 자동으로 고르지 않았어요.');
-            const record = candidates[0];
+            record = candidates[0];
             const saved = await diskChat(record);
             if (!position(record, saved) || !position(record, getContext().chat)) {
                 throw new Error('원래 채팅과 현재 내용이 달라 복구를 멈췄어요. 기존 메시지는 변경하지 않았어요.');
             }
+            if (await acknowledge(record)) return;
             const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
             if (info.state === 'running') throw new Error('서버에서 아직 답장을 받고 있어요. 완료된 뒤 다시 눌러 주세요.');
             if (info.state !== 'completed' || info.status < 200 || info.status >= 300) {
@@ -372,7 +415,12 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             change(record.id, { ...record, tab: tabId, bytes: info.bytes });
             adopted = true;
         } catch (error) {
-            if ([404, 410].includes(error.httpStatus)) notify('서버에 이 답장이 남아 있지 않아요. 서버 재시작·응답 만료·이미 전달된 요청일 수 있어요.');
+            if ([404, 410].includes(error.httpStatus)) {
+                if (await acknowledge(record)) return;
+                if (position(record, await diskChat(record))?.done) return;
+                change(record.id, null);
+                notify(`이전 요청 ${record.id.slice(0, 8)}의 응답을 찾지 못했어요 (HTTP ${error.httpStatus}). 이 안내는 현재 새로 보낸 답장의 상태와 별개예요.`);
+            }
             else notify(error.message);
         } finally { busy = false; }
         if (adopted) await recover();

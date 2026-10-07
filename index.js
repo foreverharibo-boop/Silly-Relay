@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=0.1.0-test.6';
-import { createRecovery } from './recovery.mjs?v=0.1.0-test.6';
-import { recoveryIdentity } from './identity.mjs?v=0.1.0-test.6';
+import { createTransport } from './transport.mjs?v=0.1.0-test.7';
+import { createRecovery } from './recovery.mjs?v=0.1.0-test.7';
+import { recoveryIdentity } from './identity.mjs?v=0.1.0-test.7';
 
-const VERSION = '0.1.0-test.6';
+const VERSION = '0.1.0-test.7';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -115,8 +115,8 @@ function initialize() {
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
             <p data-status></p><small data-last></small>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
-            <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>이전 실행 답장 찾기</button></div>
-            <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침하거나 홈 화면 웹앱을 다시 실행한 뒤 같은 채팅을 열면 일반 답장을 자동 복구합니다. 현재 복구 대상은 1:1 채팅의 Chat Completion 일반 답변·재생성입니다.</small>
+            <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>답장 복구 확인</button></div>
+            <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침하거나 홈 화면 웹앱을 다시 실행한 뒤 같은 채팅을 열면 일반 답장을 자동 복구합니다. 현재 복구 대상은 1:1 채팅의 Chat Completion 일반 답변·재생성입니다. 스와이프·계속쓰기는 웹앱 완전 종료나 새로고침 후 복구를 아직 지원하지 않습니다.</small>
         </div></div>`;
     const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings');
     if (container) container.append(panel);
