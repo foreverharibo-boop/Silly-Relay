@@ -37,7 +37,7 @@ async function fixture(t, limits = {}) {
                 call.finished = true;
                 if (req.body.error) return res.status(429).json({ error: { message: 'rate limited' } });
                 if (req.body.stream) res.end('data: [DONE]\n\n');
-                else res.json({ choices: [{ message: { content: '서버가 끝까지 받은 답장 🤍' } }] });
+                else res.json({ choices: [{ message: { content: '서버가 끝까지 받은 답장 🤍', reasoning_content: req.body.testReasoning || '' } }] });
             };
             const timer = setTimeout(finish, req.body.duration || 180);
             if (req.body.stream) {
@@ -451,10 +451,66 @@ test('recovery decoder keeps SSE metadata out of the reply and rejects errors/to
     const { decodeReply } = await import('../recovery.mjs');
     const record = { stream: true, mainApi: 'openai' };
     const raw = ': heartbeat\r\n\r\ndata: {"choices":[{"delta":{"reasoning_content":"생각","content":"안"}}]}\r\n\r\ndata: {"choices":[{"delta":{"content":"녕"}}]}\r\n\r\ndata: {"usage":{"tokens":3}}\r\n\r\ndata: [DONE]\r\n\r\n';
-    assert.deepEqual(decodeReply(raw, record), { text: '안녕', reasoning: '생각', signature: null });
+    assert.deepEqual(decodeReply(raw, record, { showThoughts: true }), { text: '안녕', reasoning: '생각', signature: null });
     assert.throws(() => decodeReply('data: {"error":"bad"}\n\n', record), /오류/);
     assert.throws(() => decodeReply('data: {"choices":[{"delta":{"tool_calls":[{}]}}]}\n\n', record), /도구 호출/);
     assert.throws(() => decodeReply('data: {"usage":{"tokens":3}}\n\n', record), /텍스트/);
+});
+
+test('recovery reasoning respects both request opt-out and current setting, including old journals', async () => {
+    const { decodeReply } = await import('../recovery.mjs');
+    const chunk = { choices: [{ delta: { content: '답장', reasoning_content: '생각' } }] };
+    const json = JSON.stringify({ choices: [{ message: chunk.choices[0].delta }] });
+    for (const includeReasoning of [undefined, false, true]) {
+        for (const showThoughts of [undefined, false, true]) {
+            const expected = showThoughts === true && includeReasoning !== false;
+            const options = { showThoughts };
+            for (const stream of [false, true]) {
+                const record = { stream, mainApi: 'openai', includeReasoning };
+                const raw = stream ? `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n` : json;
+                assert.deepEqual(decodeReply(raw, record, options), {
+                    text: '답장', reasoning: expected ? '생각' : '', signature: null,
+                });
+                if (stream) {
+                    const parsed = decodeReply(raw, record, { ...options, streamChunk(data, state, settings) {
+                        assert.equal(settings.overrideShowThoughts, expected);
+                        state.reasoning += '생각'; // Even a parser ignoring the flag cannot re-enable it.
+                        state.signature = 'opaque-provider-signature';
+                        return data.choices[0].delta.content;
+                    } });
+                    assert.deepEqual(parsed, { text: '답장', reasoning: expected ? '생각' : '', signature: 'opaque-provider-signature' });
+                }
+            }
+        }
+    }
+});
+
+test('reload saves reply and swipe with reasoning only when requested and still enabled', async t => {
+    for (const requested of [false, true]) {
+        for (const current of [false, true]) {
+            const f = await fixture(t);
+            const b = await recoveryBrowser(t, f);
+            const page = await b.makePage();
+            page.ctx.chatCompletionSettings.show_thoughts = true;
+            page.arm();
+            const jobId = id();
+            await page.recovery.prepare({ id: jobId, path: PATH,
+                body: JSON.stringify({ type: 'normal', include_reasoning: requested }) });
+            assert.equal(page.recovery.list()[0].includeReasoning, requested);
+            await f.start(jobId, { duration: 10, testReasoning: '非表示の思考' });
+            page.recovery.stop();
+            const reloaded = await b.makePage();
+            reloaded.ctx.chatCompletionSettings.show_thoughts = current;
+            await reloaded.recovery.recover();
+            const message = b.disk.messages[1];
+            assert.equal(message.mes, '서버가 끝까지 받은 답장 🤍');
+            assert.equal(message.extra.reasoning, requested && current ? '非表示の思考' : '');
+            assert.equal(message.swipe_info[0].extra.reasoning, message.extra.reasoning);
+            assert.equal(message.extra[b.MARK].recovered, true);
+            assert.equal(f.calls.length, 1);
+            assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+        }
+    }
 });
 
 test('failed upstream and expired jobs leave no automatic retry or fabricated chat message', async t => {

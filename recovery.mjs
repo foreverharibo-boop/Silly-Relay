@@ -28,7 +28,10 @@ const sameChat = (a, b) => !!a && !!b && a.avatar === b.avatar && a.file === b.f
 const textContent = value => typeof value === 'string' ? value : Array.isArray(value)
     ? value.filter(p => p.type === 'text' || !p.type).map(p => p.text || '').join('') : '';
 
-export function decodeReply(raw, record, { extract, streamChunk } = {}) {
+export function decodeReply(raw, record, { extract, streamChunk, showThoughts = false } = {}) {
+    // Recovery must not turn reasoning on. Older journals have no request flag;
+    // those follow the current setting, while an explicit request opt-out stays off.
+    const includeReasoning = showThoughts === true && record.includeReasoning !== false;
     let text = '', reasoning = '';
     const streamState = { reasoning: '', images: [], signature: '', toolSignatures: {} };
     function validate(data) {
@@ -53,20 +56,20 @@ export function decodeReply(raw, record, { extract, streamChunk } = {}) {
             validate(data);
             if (data.choices?.[0]?.index > 0) continue;
             if (record.mainApi === 'openai' && streamChunk) {
-                text += streamChunk(data, streamState, { chatCompletionSource: record.source, overrideShowThoughts: true });
+                text += streamChunk(data, streamState, { chatCompletionSource: record.source, overrideShowThoughts: includeReasoning });
             } else {
                 const delta = data.choices?.[0]?.delta;
                 text += textContent(delta?.content ?? data.choices?.[0]?.text ?? data.token ?? data.delta?.text ?? '');
-                reasoning += delta?.reasoning_content ?? delta?.reasoning ?? '';
+                if (includeReasoning) reasoning += delta?.reasoning_content ?? delta?.reasoning ?? '';
             }
         }
-        reasoning += streamState.reasoning;
+        if (includeReasoning) reasoning += streamState.reasoning;
     } else {
         const data = JSON.parse(raw);
         validate(data);
         text = extract ? extract(data, record.mainApi) : textContent(data.choices?.[0]?.message?.content
             ?? data.choices?.[0]?.text ?? data.output ?? data.results?.[0]?.text ?? data.content ?? data.text);
-        reasoning = data.choices?.[0]?.message?.reasoning_content ?? data.choices?.[0]?.message?.reasoning
+        if (includeReasoning) reasoning = data.choices?.[0]?.message?.reasoning_content ?? data.choices?.[0]?.message?.reasoning
             ?? data.content?.filter?.(p => p.type === 'thinking').map(p => p.thinking || '').join('') ?? '';
     }
     if (typeof text !== 'string' || !text.trim()) throw new Error('복구할 텍스트 답장을 찾지 못했습니다.');
@@ -171,6 +174,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const record = { id, tab: tabId, identity, count: ctx.chat.length, anchor: fingerprint(ctx.chat),
             name: ctx.name2, created: Date.now(), stream: !!data.stream, mainApi: 'openai',
             source: data.chat_completion_source || ctx.chatCompletionSettings?.chat_completion_source,
+            includeReasoning: typeof data.include_reasoning === 'boolean' ? data.include_reasoning
+                : ctx.chatCompletionSettings?.show_thoughts === true,
             model: typeof data.model === 'string' ? data.model : '', bytes: null };
         // ST already saves a normal user message before generating. Do not call
         // saveChat or read the entire chat on this critical path: a delayed save,
@@ -274,7 +279,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             const message = { name: record.name, is_user: false, is_system: false,
                 send_date: new Date(finishedAt || Date.now()).toISOString(), mes: text,
                 gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
-                extra: { api: 'openai', model: record.model, reasoning: reply.reasoning || '',
+                extra: { api: 'openai', model: record.model,
+                    reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
                     reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true } },
                 swipe_id: 0, swipes: [text] };
             message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
@@ -313,7 +319,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 try {
                     const data = await readReply(record);
                     if (!data) continue;
-                    const reply = decodeReply(data.raw, data.record, await parser());
+                    const reply = decodeReply(data.raw, data.record, { ...await parser(),
+                        showThoughts: getContext()?.chatCompletionSettings?.show_thoughts === true });
                     await apply(data.record, reply, data.finishedAt);
                 } catch (error) {
                     if ([404, 410].includes(error.httpStatus)) {

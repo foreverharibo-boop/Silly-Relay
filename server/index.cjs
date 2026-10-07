@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '0.1.0-test.4';
+const VERSION = '0.1.0-test.5';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
