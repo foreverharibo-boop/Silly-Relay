@@ -174,6 +174,14 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             });
             return new Response(stream, { status, headers: responseHeaders });
         } catch (error) {
+            if (error.name === 'AbortError') {
+                cleanup();
+                // stop() owns the cancel acknowledgement / pending-cancel event.
+                // Otherwise the server has already confirmed cancellation.
+                // Keep rejecting to the caller, but do not report an AI failure.
+                if (!stopped) emit('cancelled', { id });
+                throw error;
+            }
             if (!error.httpStatus && !stopped) void sendCancel();
             cleanup(); emit('error', { id, message: error.message }); throw error;
         }

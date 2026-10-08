@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=1.0.1';
-import { createRecovery } from './recovery.mjs?v=1.0.1';
-import { recoveryIdentity } from './identity.mjs?v=1.0.1';
+import { createTransport } from './transport.mjs?v=1.0.2';
+import { createRecovery } from './recovery.mjs?v=1.0.2';
+import { recoveryIdentity } from './identity.mjs?v=1.0.2';
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
