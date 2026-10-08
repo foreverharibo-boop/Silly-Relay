@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -20,6 +20,20 @@ const DEFAULT_LIMITS = Object.freeze({
     pollMs: 10000, pageBytes: 128 * 1024,
 });
 function fail(status, message) { return Object.assign(new Error(message), { status }); }
+function internalAddress(socket) {
+    const address = socket.localAddress.replace(/^::ffff:/, '');
+    const listener = socket.server?.address?.();
+    // Only use loopback when this SAME listener is bound to all interfaces.
+    // Connecting back to its LAN/Tailscale address can make ST's whitelist
+    // reject the server itself even though the original browser was allowed.
+    // An interface-only listener (or unavailable listener metadata) must keep
+    // its accepted address. Never retry a generation at another destination.
+    if (listener && typeof listener === 'object' && listener.port === socket.localPort) {
+        if (listener.address === '0.0.0.0') return '127.0.0.1';
+        if (listener.address === '::') return address.includes(':') ? '::1' : '127.0.0.1';
+    }
+    return address;
+}
 function ownerOf(req) {
     const owner = req.user?.profile?.handle;
     if (typeof owner !== 'string' || !owner) throw fail(401, '실리태번 로그인 상태를 확인해 주세요.');
@@ -57,7 +71,7 @@ function createRelay(overrides = {}) {
         if (state === 'failed' || state === 'cancelled') release(job);
         job.events.emit('change');
         // Metadata only. Never log the body, character names, cookies or keys.
-        console.log(`[Silly Relay] ${job.id.slice(0, 8)} ${state} (${job.size} bytes)`);
+        console.log(`[Silly Relay] ${job.id.slice(0, 8)} ${state} (HTTP ${job.status || 'pending'}, ${job.size} bytes)`);
     }
     function cancel(job) {
         const upstream = job.upstream;
@@ -124,13 +138,12 @@ function createRelay(overrides = {}) {
             events: new EventEmitter(), upstream: null, timer: null };
         jobs.set(keyOf(owner, id), job);
         const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
-            'accept-encoding': 'identity', connection: 'close' };
+            'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
         // Authenticate the internal HTTP request through ST's own middleware again.
         for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-silly-pop', 'accept', 'host']) {
             if (typeof req.headers[name] === 'string') headers[name] = req.headers[name];
         }
-        let address = req.socket.localAddress;
-        if (address.startsWith('::ffff:')) address = address.slice(7);
+        const address = internalAddress(req.socket);
         const upstream = http.request({ hostname: address, port: req.socket.localPort,
             path, method: 'POST', headers, agent: false }, response => {
             job.status = response.statusCode || 502;
@@ -244,4 +257,4 @@ async function init(router) {
     console.log(`[Silly Relay] ${VERSION} loaded`);
 }
 async function exit() { relay?.close(); }
-module.exports = { info, init, exit, createRelay };
+module.exports = { info, init, exit, createRelay, internalAddress };
