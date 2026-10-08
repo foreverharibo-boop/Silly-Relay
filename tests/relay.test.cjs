@@ -919,3 +919,65 @@ test('live swipe is acknowledged after saving even when another candidate is sel
     assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
     assert.equal(page.ctx.chat[1].swipe_id, 0); assert.equal(b.rendered.length, 0);
 });
+
+test('delivered HTTP errors release recovery slots so subsequent replies are admitted', async t => {
+    const f = await fixture(t, { perUserJobs: 1 });
+    const b = await recoveryBrowser(t, f), page = await b.makePage();
+    for (let attempt = 0; attempt < 3; attempt++) {
+        page.arm();
+        const response = await page.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+            body: '{"type":"normal","error":true,"duration":5}' });
+        assert.equal(response.status, 429);
+        assert.match(await response.text(), /rate limited/);
+        const jobId = response.headers.get('x-silly-relay-job');
+        for (let tries = 0; tries < 30 && (await f.request(`/jobs/${jobId}`)).status !== 410; tries++) await delay(5);
+        assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+        assert.equal(page.recovery.list().length, 0);
+    }
+    assert.equal(f.calls.length, 3);
+});
+
+test('untyped auxiliary calls cannot consume the main reply recovery ticket', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm();
+    assert.equal(await page.recovery.prepare({ id: id(), path: PATH,
+        body: JSON.stringify({ model: 'auxiliary', messages: [{ role: 'user', content: '.' }] }) }), false);
+    assert.equal(page.recovery.list().length, 0);
+    assert.equal(await page.recovery.prepare({ id: id(), path: PATH, body: '{"type":"normal"}' }), true);
+});
+
+test('final request event preserves recovery for an untyped main reply and ignores notification metadata', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm();
+    const data = { model: 'chat-model', messages: [{ role: 'user', content: 'hello' }] };
+    page.recovery.settingsReady(data);
+    assert.deepEqual(Object.keys(data), ['model', 'messages']);
+    assert.equal(await page.recovery.prepare({ id: id(), path: PATH,
+        body: JSON.stringify({ ...data, model: 'auxiliary' }) }), false);
+    data.silly_pop_ios = { requestId: id() };
+    assert.equal(await page.recovery.prepare({ id: id(), path: PATH, body: JSON.stringify(data) }), true);
+});
+
+test('HTTP error recovered after reload is drained and released without writing a chat message', async t => {
+    const f = await fixture(t, { perUserJobs: 1, pageBytes: 7 }), b = await recoveryBrowser(t, f);
+    const old = await b.makePage(), jobId = id(); old.arm();
+    await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+    await f.start(jobId, { error: true, duration: 20 }); old.recovery.stop();
+    const fresh = await b.makePage(); await fresh.recovery.recover();
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.equal((await f.start(id(), { duration: 5 })).status, 202);
+});
+
+test('capacity diagnostics distinguish active generations from retained replies', async t => {
+    const f = await fixture(t, { perUserActive: 1, perUserJobs: 1 });
+    const jobId = id(); await f.start(jobId, { duration: 100 });
+    const active = await f.start(id()); assert.equal(active.status, 429);
+    assert.match((await active.json()).error, /동시 생성 한도.*1\/1/);
+    await delay(150);
+    const retained = await f.start(id()); assert.equal(retained.status, 429);
+    assert.match((await retained.json()).error, /보관 한도.*1\/1/);
+    assert.equal(f.calls.length, 1);
+    assert.equal((await f.get(jobId)).state, 'completed');
+});

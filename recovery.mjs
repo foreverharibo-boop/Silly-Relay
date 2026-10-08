@@ -233,12 +233,26 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             ? { type: type || 'normal', identity: chatIdentity(getContext()), armed: false } : null;
     }
     function dataReady(_data, dryRun) { if (ticket && !dryRun) ticket.armed = true; }
+    function requestFingerprint(data) {
+        // Notification extensions may append their metadata after this event.
+        const { silly_pop_ios, silly_pop, ...payload } = data;
+        return fingerprint([{ mes: JSON.stringify(payload) }]);
+    }
+    function settingsReady(data) {
+        if (ticket?.armed && data && [undefined, 'normal', 'regenerate', 'swipe'].includes(data.type)) {
+            ticket.requestFingerprint = requestFingerprint(data);
+        }
+    }
     async function prepare({ id, path, body }) {
         const data = JSON.parse(body);
         // Never turn quiet/translation/review/tool requests into character messages.
         if (!ticket?.armed || ![undefined, 'normal', 'regenerate', 'swipe'].includes(data.type)
             || path !== '/api/backends/chat-completions/generate' || (data.n || 1) > 1 || data.tools?.length) return false;
         if ((data.type === 'swipe') !== (ticket.type === 'swipe') && data.type !== undefined) return false;
+        // An untyped helper request (e.g. validation) must not steal the main
+        // generation's journal. Legacy untyped main requests are bound by ST's
+        // final request event, without adding fields to the outgoing payload.
+        if (data.type === undefined && ticket.requestFingerprint !== requestFingerprint(data)) return false;
         const currentTicket = ticket;
         ticket = null;
         await identify();
@@ -325,15 +339,19 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 change(record.id, null);
                 throw new Error(state.error || '생성이 중지되었습니다.');
             }
-            if (state.status && (state.status < 200 || state.status >= 300)) {
-                change(record.id, null);
-                throw new Error(`AI 요청이 실패했습니다 (HTTP ${state.status}).`);
-            }
             if (state.cursor !== cursor || state.next < cursor) throw new Error('복구 응답 위치가 일치하지 않습니다.');
             const bytes = Uint8Array.from(atob(state.data), c => c.charCodeAt(0));
             if (bytes.length !== state.next - cursor || state.next > 8 * 1024 * 1024) throw new Error('복구 응답 크기가 올바르지 않습니다.');
             chunks.push(bytes); cursor = state.next;
             if (state.state === 'completed' && cursor === state.bytes) break;
+        }
+        if (state.status < 200 || state.status >= 300) {
+            // An HTTP error has no chat message to save. Release it only after
+            // the full error response has been read, just like the live path.
+            await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
+                body: JSON.stringify({ cursor }) });
+            change(record.id, null); live.delete(record.id);
+            throw new Error(`AI 요청이 실패했습니다 (HTTP ${state.status}).`);
         }
         const joined = new Uint8Array(cursor);
         let offset = 0;
@@ -501,5 +519,5 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
     }
     function stop() { stopped = true; }
-    return { prepare, event, tag, generationStarted, dataReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
+    return { prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }

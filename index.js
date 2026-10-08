@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=1.0.2';
-import { createRecovery } from './recovery.mjs?v=1.0.2';
-import { recoveryIdentity } from './identity.mjs?v=1.0.2';
+import { createTransport } from './transport.mjs?v=1.0.3';
+import { createRecovery } from './recovery.mjs?v=1.0.3';
+import { recoveryIdentity } from './identity.mjs?v=1.0.3';
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -154,6 +154,7 @@ function initialize() {
         };
         on('GENERATION_STARTED', recovery.generationStarted);
         on('GENERATE_AFTER_DATA', recovery.dataReady);
+        on('CHAT_COMPLETION_SETTINGS_READY', recovery.settingsReady);
         on('GENERATION_ENDED', recovery.generationEnded);
         on('GENERATION_STOPPED', recovery.generationStopped);
         on('STREAM_TOKEN_RECEIVED', () => recovery.tag(null, false));

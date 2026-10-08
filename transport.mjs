@@ -110,7 +110,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             emit('accepted', { id, reloadRecovery: !!retainForRecovery });
             let cursor = 0;
             async function acknowledge() {
-                if (retainForRecovery) return;
+                if (retainForRecovery && status >= 200 && status < 300) return;
                 // This is a receipt, never another AI request. Lost receipts are harmless;
                 // the unacknowledged temporary buffer also has a fixed expiry.
                 for (let attempt = 0; attempt < 3; attempt++) {

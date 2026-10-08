@@ -4,7 +4,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -128,10 +128,17 @@ function createRelay(overrides = {}) {
         if (!req.socket.localAddress || !req.socket.localPort) throw fail(503, '실리태번 서버 주소를 확인할 수 없습니다.');
         const pending = [...jobs.values()].filter(j => j.state === 'running' || j.state === 'completed');
         const active = pending.filter(j => j.state === 'running');
-        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || pending.filter(j => j.owner === owner).length >= limits.perUserJobs
-            || totalBytes >= limits.totalBytes || active.length >= limits.active
-            || active.filter(j => j.owner === owner).length >= limits.perUserActive) {
-            throw fail(429, '전송 대기 또는 동시 생성 한도에 도달했습니다. 잠시 기다려 주세요.');
+        const ownPending = pending.filter(j => j.owner === owner).length;
+        const ownActive = active.filter(j => j.owner === owner).length;
+        if (ownActive >= limits.perUserActive) {
+            throw fail(429, `동시 생성 한도: 이 계정에서 ${ownActive}/${limits.perUserActive}개 요청을 처리 중입니다. 이번 요청은 접수되지 않았습니다.`);
+        }
+        if (ownPending >= limits.perUserJobs) {
+            throw fail(429, `보관 한도: 이 계정에 전달·저장 확인을 기다리는 요청이 ${ownPending}/${limits.perUserJobs}개 있습니다. 이번 요청은 접수되지 않았습니다.`);
+        }
+        if (active.length >= limits.active) throw fail(429, '서버 전체 동시 생성 한도입니다. 잠시 뒤 다시 시도해 주세요. 이번 요청은 접수되지 않았습니다.');
+        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || totalBytes >= limits.totalBytes) {
+            throw fail(429, '서버 전체 응답 보관 한도입니다. 이번 요청은 접수되지 않았습니다.');
         }
         const job = { owner, id, digest, state: 'running', chunks: [], size: 0,
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
