@@ -9,7 +9,7 @@ const id = () => randomBytes(16).toString('hex');
 const PATH = '/api/backends/chat-completions/generate';
 const AUTH = { cookie: 'user=alice', 'x-csrf-token': 'test-csrf', 'content-type': 'application/json' };
 
-async function fixture(t, limits = {}) {
+async function fixture(t, limits = {}, network = {}) {
     const routes = [];
     const router = {};
     for (const method of ['get', 'post']) router[method] = (path, handler) => routes.push({ method: method.toUpperCase(), path, handler });
@@ -30,7 +30,9 @@ async function fixture(t, limits = {}) {
         const url = new URL(req.url, 'http://localhost');
         req.query = Object.fromEntries(url.searchParams);
         if (url.pathname === PATH) {
-            const call = { user, body: req.body, finished: false, cancelled: false };
+            if (network.rejectGeneration) return res.status(403).json({ error: 'internal request denied' });
+            const call = { user, body: req.body, headers: req.headers, localAddress: req.socket.localAddress,
+                finished: false, cancelled: false };
             calls.push(call);
             const finish = () => {
                 if (res.destroyed) return;
@@ -57,18 +59,82 @@ async function fixture(t, limits = {}) {
             const match = path.match(new RegExp(`^${pattern}$`));
             if (route.method !== req.method || !match) continue;
             req.params = Object.fromEntries(names.map((name, i) => [name, match[i + 1]]));
+            if (path === '/jobs' && req.method === 'POST' && network.acceptedAddress) {
+                // Model a request accepted on a LAN/Tailscale interface of this
+                // real listener without requiring a VPN interface on the test host.
+                return route.handler({ ...req, headers: req.headers, socket: {
+                    localAddress: network.acceptedAddress, localPort: req.socket.localPort,
+                    server: network.hideListener ? undefined : req.socket.server,
+                } }, res);
+            }
             return route.handler(req, res);
         }
         res.status(404).json({ error: 'not found' });
     });
-    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const base = `http://127.0.0.1:${server.address().port}`;
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, network.listenHost || '127.0.0.1', resolve);
+    });
+    const base = `http://${network.clientHost || '127.0.0.1'}:${server.address().port}`;
     t.after(async () => { relay.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
     const request = (path, init = {}) => fetch(base + '/api/plugins/silly-relay' + path, { ...init, headers: { ...AUTH, ...init.headers } });
     const start = async (jobId, body = {}, path = PATH) => request('/jobs', { method: 'POST', body: JSON.stringify({ id: jobId, path, body: JSON.stringify(body) }) });
     const get = async jobId => (await request(`/jobs/${jobId}`)).json();
     return { base, request, start, get, calls };
 }
+
+test('wildcard IPv4 listener routes LAN and mapped Tailscale requests through authenticated loopback once', async t => {
+    for (const acceptedAddress of ['192.0.2.10', '::ffff:100.85.10.10']) {
+        const f = await fixture(t, {}, { listenHost: '0.0.0.0', acceptedAddress });
+        const { createTransport } = await import('../transport.mjs');
+        const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+        const body = { duration: 10, messages: [{ role: 'user', content: 'preserve prompt' }] };
+        const response = await transport.fetch(f.base + PATH, {
+            method: 'POST', headers: { ...AUTH, host: 'untrusted.invalid:9', 'x-forwarded-for': '203.0.113.5' },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        assert.ok((await response.json()).choices);
+        assert.equal(f.calls.length, 1);
+        assert.equal(f.calls[0].localAddress, '127.0.0.1');
+        assert.equal(f.calls[0].user, 'alice');
+        assert.equal(f.calls[0].headers['x-csrf-token'], AUTH['x-csrf-token']);
+        assert.match(f.calls[0].headers['user-agent'], /^Silly-Relay\//);
+        assert.equal(f.calls[0].headers['x-forwarded-for'], undefined);
+        assert.deepEqual(f.calls[0].body, body);
+    }
+});
+
+test('target selection respects IPv6 family, interface-only binding and listener port identity', () => {
+    const { internalAddress } = require('../server/index.cjs');
+    const socket = (localAddress, address, port = 8000) => ({
+        localAddress, localPort: 8000, server: { address: () => ({ address, port }) },
+    });
+    assert.equal(internalAddress(socket('2001:db8::10', '::')), '::1');
+    assert.equal(internalAddress(socket('::ffff:100.85.10.10', '::')), '127.0.0.1');
+    assert.equal(internalAddress(socket('100.85.10.10', '100.85.10.10')), '100.85.10.10');
+    assert.equal(internalAddress(socket('2001:db8::10', '2001:db8::10')), '2001:db8::10');
+    assert.equal(internalAddress(socket('100.85.10.10', '0.0.0.0', 9000)), '100.85.10.10');
+});
+
+test('missing listener metadata preserves the accepted address and mapped IPv4 normalization', async t => {
+    const f = await fixture(t, {}, { acceptedAddress: '::ffff:127.0.0.1', hideListener: true });
+    const jobId = id();
+    await f.start(jobId, { duration: 10 });
+    await delay(60);
+    assert.equal((await f.get(jobId)).status, 200);
+    assert.equal(f.calls.length, 1);
+});
+
+test('loopback still applies server rejection without an alternate generation attempt', async t => {
+    const f = await fixture(t, {}, { listenHost: '0.0.0.0', acceptedAddress: '100.85.10.10', rejectGeneration: true });
+    const { createTransport } = await import('../transport.mjs');
+    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+    const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{}' });
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: 'internal request denied' });
+    assert.equal(f.calls.length, 0);
+});
 
 test('control: ordinary HTTP generation is cancelled when its browser connection closes', async t => {
     const f = await fixture(t);
