@@ -95,7 +95,7 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
 }
 
 export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage, tabId,
-    formatReply = async text => text, parser = async () => ({}), notify = () => {},
+    formatReply = async text => text, parser = async () => ({}), notify = () => {}, diagnostic = () => {},
     isVisible = () => true, allowPreviousSession = false }) {
     let owner = null, ticket = null, generating = false, busy = false;
     const live = new Set();
@@ -455,7 +455,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (await acknowledge(record)) notify('다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
         return true;
     }
-    async function recover() {
+    async function recover({ manual = false } = {}) {
         if (busy || generating || stopped || !isVisible()) return;
         busy = true;
         try {
@@ -476,9 +476,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         if (await acknowledge(record)) continue;
                         if (position(record, await diskChat(record))?.done) continue;
                         change(record.id, null);
-                        warn(record, error.httpStatus === 410
-                            ? `요청 ${record.id.slice(0, 8)}: 서버는 전달 완료로 표시하지만 채팅 저장을 확인하지 못했어요.`
-                            : `요청 ${record.id.slice(0, 8)}: 서버에서 이 요청을 찾지 못했어요 (HTTP 404). 원인은 아직 확인되지 않았어요.`);
+                        const message = error.httpStatus === 410
+                            ? `이전 복구 요청 ${record.id.slice(0, 8)}: 서버는 전달 완료로 표시하지만 채팅 저장을 확인하지 못했어요 (HTTP 410). 현재 새 답장의 생성 결과와는 별개예요.`
+                            : `이전 복구 요청 ${record.id.slice(0, 8)}: 서버에 응답이 남아 있지 않아 복구할 수 없어요 (HTTP 404). 현재 새 답장의 생성 결과와는 별개이며, 사라진 원인은 확인되지 않았어요.`;
+                        // Startup/chat-open checks are not new generation errors.
+                        // Keep the diagnosis visible in settings; a user-requested
+                        // recovery still receives direct feedback.
+                        diagnostic(message);
+                        if (manual) warn(record, message);
                     } else if (!(error instanceof TypeError || ['TimeoutError', 'AbortError'].includes(error.name))) {
                         warn(record, error.message);
                     }
@@ -499,7 +504,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         await identify();
         if (list().some(r => sameChat(r.identity, chatIdentity(getContext())))) {
             // Prefer this installation's current reply over stale legacy IDs.
-            await recover();
+            await recover({ manual: true });
             return;
         }
         let adopted = false;
@@ -540,7 +545,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             }
             else notify(error.message);
         } finally { busy = false; }
-        if (adopted) await recover();
+        if (adopted) await recover({ manual: true });
     }
     function generationEnded() {
         generating = false; ticket = null;

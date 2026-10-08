@@ -362,7 +362,7 @@ async function recoveryBrowser(t, f) {
     const storageMap = new Map();
     const storage = { getItem: key => storageMap.get(key) || null, setItem: (key, value) => storageMap.set(key, value) };
     const disk = { messages: [{ name: 'User', is_user: true, mes: '안녕', send_date: '2026-10-07' }], failSave: false };
-    const messages = [], rendered = [], emitted = [];
+    const messages = [], rendered = [], emitted = [], diagnostics = [];
     async function makePage(tabId = 'same-tab', options = {}) {
         const ctx = { chat: copy(disk.messages), characters: [{ avatar: 'Char.png' }], characterId: 0,
             chatId: 'Chat A', name2: 'Character', groupId: null, chatCompletionSettings: { chat_completion_source: 'custom' },
@@ -378,12 +378,13 @@ async function recoveryBrowser(t, f) {
         const transport = createTransport({ fetchImpl: request, origin: f.base, enabled: () => true,
             prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => recovery.event(type, data) });
         recovery = createRecovery({ getContext: () => ctx, api: transport.api, fetchImpl: request,
-            getHeaders: () => AUTH, storage, tabId, ...options, notify: text => messages.push(text) });
+            getHeaders: () => AUTH, storage, tabId, ...options, notify: text => messages.push(text),
+            diagnostic: text => diagnostics.push(text) });
         t.after(() => recovery.stop());
         const arm = () => { recovery.generationStarted('normal'); recovery.dataReady({}, false); };
         return { ctx, recovery, transport, arm };
     }
-    return { makePage, disk, messages, rendered, emitted, MARK };
+    return { makePage, disk, messages, rendered, emitted, diagnostics, MARK };
 }
 
 test('reload before completion restores JSON and split-Unicode SSE into the original chat exactly once', async t => {
@@ -528,6 +529,39 @@ test('a failed recovery save retains the reply; retry saves the same message wit
     assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
 });
 
+test('automatic missing-response checks record a diagnostic without a toast; explicit recovery still reports it', async t => {
+    for (const status of [404, 410]) for (const manual of [false, true]) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f);
+        const old = await b.makePage(); old.arm(); const jobId = id();
+        await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        old.recovery.stop();
+        if (status === 410) {
+            await f.start(jobId, { duration: 10 });
+            await delay(40);
+            const info = await f.get(jobId);
+            assert.equal(info.state, 'completed');
+            assert.equal((await f.request(`/jobs/${jobId}/ack`, {
+                method: 'POST', body: JSON.stringify({ cursor: info.bytes }),
+            })).status, 200);
+        }
+        const before = structuredClone(b.disk.messages);
+        const fresh = await b.makePage('same-tab', { allowPreviousSession: true });
+        if (manual) await fresh.recovery.recoverPreviousSession();
+        else await fresh.recovery.recover();
+        assert.deepEqual(b.disk.messages, before);
+        assert.deepEqual(fresh.ctx.chat, before);
+        assert.equal(fresh.recovery.list().length, 0);
+        assert.equal(b.diagnostics.length, 1);
+        assert.match(b.diagnostics[0], new RegExp(`HTTP ${status}`));
+        assert.ok(b.diagnostics[0].includes(jobId.slice(0, 8)));
+        assert.equal(b.messages.length, manual ? 1 : 0);
+        assert.equal(b.emitted.length, 0);
+        assert.equal(b.rendered.length, 0);
+        await fresh.recovery.recover();
+        assert.equal(b.diagnostics.length, 1, 'stale records do not keep polling or reporting');
+    }
+});
+
 test('wrong chat, edited history and a new unmarked answer are never overwritten', async t => {
     for (const conflict of ['wrong-chat', 'edit', 'new-answer']) {
         const f = await fixture(t); const b = await recoveryBrowser(t, f);
@@ -650,7 +684,7 @@ test('failed upstream and expired jobs leave no automatic retry or fabricated ch
         assert.equal(b.disk.messages.length, 1);
         assert.equal(next.recovery.list().length, 0);
         assert.equal(f.calls.length, 1);
-        assert.ok(b.messages.length > 0);
+        assert.ok((mode === 'expired' ? b.diagnostics : b.messages).length > 0);
     }
 });
 
