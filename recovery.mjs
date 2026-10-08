@@ -176,6 +176,26 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
         return null;
     }
+    function exactSavedReply(record, chat, text) {
+        // Some post-processing paths save the answer without our completion
+        // marker. Text alone is not a receipt: require the original history,
+        // exact slot, character and (for swipes) all previous candidates too.
+        if (chat.length !== record.count + 1
+            || fingerprint(chat.slice(0, record.count)) !== record.anchor) return false;
+        const message = chat[record.count];
+        if (!message || message.is_user || message.is_system || message.name !== record.name
+            || message.mes !== text) return false;
+        const selected = message.swipe_id ?? 0;
+        if (message.extra?.[MARK]?.id && message.extra[MARK].id !== record.id) return false;
+        const candidateMark = message.swipe_info?.[selected]?.extra?.[MARK];
+        if (candidateMark?.id && candidateMark.id !== record.id) return false;
+        if (isSwipe(record)) {
+            return selected === record.swipeCount && variants(message).length === record.swipeCount + 1
+                && variants(message)[selected] === text
+                && swipeAnchor(message, record.swipeCount) === record.swipeAnchor;
+        }
+        return selected === 0 && variants(message).length === 1 && variants(message)[0] === text;
+    }
     function showSaved(record, saved) {
         const ctx = getContext();
         if (stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
@@ -364,12 +384,27 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         let ctx = getContext();
         if (generating || !sameChat(chatIdentity(ctx), record.identity)) return false;
         const saved = await diskChat(record);
+        // A new generation/chat switch can happen while the disk read is pending.
+        if (generating || stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         if (position(record, saved)?.done) { await acknowledge(record); return true; }
-        if (!position(record, saved)) throw new Error('서버의 채팅 내용이 바뀌어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
         const text = await formatReply(reply.text);
         if (!text.trim()) throw new Error('답장 정리 후 복구할 본문이 없습니다.');
         ctx = getContext();
-        if (generating || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        if (generating || stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
+            // Already durable AND visible. Release only this response, with no
+            // chat write, replayed hooks or misleading recovery success toast.
+            try {
+                await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
+                    body: JSON.stringify({ cursor: record.bytes }) });
+            } catch (error) {
+                if (![404, 410].includes(error.httpStatus)) throw error;
+            }
+            change(record.id, null);
+            live.delete(record.id);
+            return true;
+        }
+        if (!position(record, saved)) throw new Error('서버의 채팅 내용이 바뀌어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
         const target = position(record, ctx.chat);
         if (!target) throw new Error('채팅에 새 메시지나 수정이 있어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
         if (!target.done) {

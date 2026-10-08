@@ -450,6 +450,66 @@ test('normal live completion deletes the response only after the marked chat is 
     assert.equal(b.disk.messages.length, 2);
 });
 
+test('a durable visible reply without a completion marker is acknowledged without warnings or chat writes', async t => {
+    for (const swipe of [false, true]) for (const stream of [false, true]) {
+        const f = await fixture(t, { pageBytes: 7 }), b = await recoveryBrowser(t, f);
+        if (swipe) seedSwipes(b);
+        const old = await b.makePage();
+        swipe ? armSwipe(old) : old.arm();
+        const jobId = id();
+        await old.recovery.prepare({ id: jobId, path: PATH, body: JSON.stringify({ type: swipe ? 'swipe' : 'normal', stream }) });
+        await f.start(jobId, { stream, duration: 60 });
+        old.recovery.stop();
+        const text = stream ? '안녕 🤍' : '서버가 끝까지 받은 답장 🤍';
+        if (swipe) {
+            const last = b.disk.messages.at(-1);
+            last.mes = text; last.swipe_id = last.swipes.length;
+            last.swipes.push(text); last.swipe_info.push({ extra: {} }); last.extra = {};
+        } else {
+            b.disk.messages.push({ name: 'Character', is_user: false, mes: text, extra: {} });
+        }
+        const before = structuredClone(b.disk.messages);
+        const fresh = await b.makePage();
+        fresh.ctx.saveChat = async () => { assert.fail('receipt must not rewrite the chat'); };
+        await fresh.recovery.recover();
+        assert.deepEqual(b.disk.messages, before);
+        assert.deepEqual(fresh.ctx.chat, before);
+        assert.equal(fresh.recovery.list().length, 0);
+        assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+        assert.deepEqual(b.messages, []);
+        assert.deepEqual(b.emitted, []);
+        assert.deepEqual(b.rendered, []);
+    }
+});
+
+test('text fallback never acknowledges a different, edited, unsaved or foreign reply', async t => {
+    for (const conflict of ['text', 'history', 'unsaved', 'foreign', 'later-message', 'swipe']) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f);
+        const old = await b.makePage(); old.arm(); const jobId = id();
+        await old.recovery.prepare({ id: jobId, path: PATH, body: '{"type":"normal"}' });
+        await f.start(jobId, { duration: 10 }); old.recovery.stop();
+        b.disk.messages.push({ name: 'Character', is_user: false, mes: '서버가 끝까지 받은 답장 🤍', extra: {} });
+        if (conflict === 'text') b.disk.messages[1].mes = '다른 답장';
+        if (conflict === 'history') b.disk.messages[0].mes = '수정한 기록';
+        if (conflict === 'foreign') b.disk.messages[1].extra[b.MARK] = { id: id(), complete: true };
+        if (conflict === 'later-message') b.disk.messages.push({ name: 'User', is_user: true, mes: '다음 메시지' });
+        if (conflict === 'swipe') {
+            b.disk.messages[1].swipes = ['이전 후보', b.disk.messages[1].mes];
+            b.disk.messages[1].swipe_id = 1;
+        }
+        const fresh = await b.makePage();
+        if (conflict === 'unsaved') fresh.ctx.chat[1].mes = '아직 저장하지 않은 수정';
+        const saved = structuredClone(b.disk.messages), visible = structuredClone(fresh.ctx.chat);
+        await fresh.recovery.recover();
+        assert.deepEqual(b.disk.messages, saved);
+        assert.deepEqual(fresh.ctx.chat, visible);
+        assert.equal(fresh.recovery.list().length, 1);
+        assert.equal((await f.get(jobId)).state, 'completed');
+        assert.equal(b.rendered.length, 0);
+        assert.equal(b.emitted.length, 0);
+    }
+});
+
 test('a failed recovery save retains the reply; retry saves the same message without duplication', async t => {
     const f = await fixture(t);
     const b = await recoveryBrowser(t, f);
