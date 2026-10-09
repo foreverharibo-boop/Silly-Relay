@@ -2,7 +2,6 @@ import { createTransport } from './transport.mjs?v=1.0.5';
 import { createRecovery } from './recovery.mjs?v=1.0.5';
 import { recoveryIdentity } from './identity.mjs?v=1.0.5';
 
-const VERSION = '1.0.5';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -118,7 +117,7 @@ function initialize() {
     panel.id = 'silly-relay-settings';
     panel.className = 'extension_container';
     panel.innerHTML = `<div class="inline-drawer">
-        <div class="inline-drawer-toggle inline-drawer-header"><b>Silly Relay <small>${VERSION}</small></b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
+        <div class="inline-drawer-toggle inline-drawer-header"><b>Silly Relay</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
         <div class="inline-drawer-content">
             <label class="checkbox_label"><input type="checkbox"><span>연결 유지</span></label>
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
