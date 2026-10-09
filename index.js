@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=1.0.4';
-import { createRecovery } from './recovery.mjs?v=1.0.4';
-import { recoveryIdentity } from './identity.mjs?v=1.0.4';
+import { createTransport } from './transport.mjs?v=1.0.5';
+import { createRecovery } from './recovery.mjs?v=1.0.5';
+import { recoveryIdentity } from './identity.mjs?v=1.0.5';
 
-const VERSION = '1.0.4';
+const VERSION = '1.0.5';
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
 let active = false;
@@ -11,6 +11,7 @@ let transport;
 let hook;
 let state = '연결 확인을 눌러 주세요.';
 let lastEvent = '아직 생성 요청이 없습니다.';
+let lastRecoveryEvent = '';
 let checking = false;
 let recovery;
 const context = () => globalThis.SillyTavern?.getContext?.();
@@ -32,6 +33,9 @@ function update() {
     if (!panel) return;
     panel.querySelector('[data-status]').textContent = state;
     panel.querySelector('[data-last]').textContent = lastEvent;
+    const recoveryStatus = panel.querySelector('[data-recovery]');
+    recoveryStatus.textContent = lastRecoveryEvent;
+    recoveryStatus.hidden = !lastRecoveryEvent;
     panel.querySelector('input').checked = active;
 }
 function notify(message) {
@@ -98,6 +102,11 @@ function initialize() {
             streamChunk: (await import('/scripts/openai.js')).getStreamingReply }),
         formatReply: async text => (await import('/script.js')).cleanUpMessage({
             getMessage: text, isImpersonate: false, isContinue: false }),
+        diagnostic: message => {
+            lastRecoveryEvent = `최근 복구 확인 (${new Date().toLocaleTimeString()}): ${message}`;
+            update();
+            console.info('[Silly Relay] recovery:', message);
+        },
         notify: (message, success) => {
             lastEvent = message; update();
             if (success) globalThis.toastr?.success(message, 'Silly Relay');
@@ -114,6 +123,7 @@ function initialize() {
             <label class="checkbox_label"><input type="checkbox"><span>연결 유지</span></label>
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
             <p data-status></p><small data-last></small>
+            <p data-recovery hidden></p>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
             <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>답장 복구 확인</button></div>
             <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침하거나 홈 화면 웹앱을 다시 실행한 뒤 같은 채팅을 열면 일반 답장을 자동 복구합니다. 1:1 Chat Completion의 일반 답변·재생성·스와이프를 복구합니다. 스와이프는 기존 후보를 유지하며 새 후보 하나를 복구합니다. 계속쓰기·그룹 채팅은 아직 복구 대상이 아닙니다.</small>
