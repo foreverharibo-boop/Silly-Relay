@@ -39,7 +39,7 @@ cp -R -- "$relay_source/server" "$plugin_dest/server"
 for relay_file in manifest.json index.js transport.mjs recovery.mjs identity.mjs reply-filter.mjs reply-session.mjs style.css LICENSE; do
     cp -- "$relay_source/$relay_file" "$extension_dest/"
 done
-echo "Silly Relay 서버 1.0.2 / 웹 확장 1.0.7 설치 완료"
+echo "Silly Relay 서버 1.0.2 / 웹 확장 1.0.8 설치 완료"
 echo "config.yaml의 enableServerPlugins: true를 확인하고 서버를 완전히 재시작해 주세요."
 echo "실리를 새로고침한 뒤 확장 설정 → Silly Relay → 연결 확인 → 연결 유지을 켜세요."
 

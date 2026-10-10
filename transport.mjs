@@ -15,6 +15,18 @@ function decode(data) {
     const binary = atob(data);
     return Uint8Array.from(binary, c => c.charCodeAt(0));
 }
+function linkedSignal(primary, review) {
+    if (!review || primary === review) return { signal: primary, dispose() {} };
+    const controller = new AbortController();
+    const signals = [primary, review].filter(Boolean);
+    const abort = () => controller.abort();
+    for (const signal of signals) {
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+    }
+    return { signal: controller.signal,
+        dispose() { for (const signal of signals) signal.removeEventListener('abort', abort); } };
+}
 
 export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {},
     shouldRelay = () => false,
@@ -57,11 +69,16 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         try { payload = JSON.parse(body); }
         catch { return fetchImpl(input, init); }
         let isReply = false;
-        try { isReply = !!sequence || shouldRelay({ path: url.pathname, payload }) === true; }
+        try {
+            const decision = sequence ? { sequence } : shouldRelay({ path: url.pathname, payload });
+            sequence ||= decision?.sequence;
+            isReply = decision === true || !!sequence;
+        }
         catch { /* Unknown requests retain the original transport. */ }
         if (!isReply) return fetchImpl(input, init);
-        const signal = init?.signal ?? request?.signal;
-        if (signal?.aborted) throw abortError();
+        const link = linkedSignal(init?.signal ?? request?.signal, sequence?.signal);
+        const signal = link.signal;
+        if (signal?.aborted) { link.dispose(); throw abortError(); }
         const headers = new Headers(init?.headers ?? request?.headers);
         headers.set('content-type', 'application/json');
         const credentials = init?.credentials ?? request?.credentials ?? 'same-origin';
@@ -75,11 +92,11 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             // suppress the one original AI request or retry it by another route.
             emit('recovery-unavailable', { id, message: error.message || '복구 준비 실패' });
         }
-        if (signal?.aborted) { emit('cancelled', { id }); throw abortError(); }
+        if (signal?.aborted) { link.dispose(); emit('cancelled', { id }); throw abortError(); }
         let stopped = false;
         let detached = false;
         let streamController;
-        const cleanup = () => { detached = true; signal?.removeEventListener('abort', stop); };
+        const cleanup = () => { detached = true; signal?.removeEventListener('abort', stop); link.dispose(); };
         async function sendCancel() {
             try {
                 await api(`/jobs/${id}/cancel`, { method: 'POST', headers, credentials, body: '{}' });

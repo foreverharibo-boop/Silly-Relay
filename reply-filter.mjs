@@ -7,10 +7,15 @@ const serialize = data => JSON.stringify(data, (key, value) =>
 
 export function createReplyFilter() {
     const frames = [];
+    let capture = null;
     const current = () => frames.at(-1);
     function generationStarted(type, options = {}, dryRun = false) {
         if (frames.length >= 32) frames.length = 0;
-        frames.push({ eligible: !dryRun && !options?.quietToLoud && replyTypes.has(type), data: null, request: null });
+        const scoped = !dryRun && !options?.quietToLoud && type === 'quiet' && capture && !capture.used
+            && options?.quiet_prompt === capture.prompt ? capture : null;
+        if (scoped) scoped.used = true;
+        frames.push({ eligible: !dryRun && !options?.quietToLoud && (replyTypes.has(type) || !!scoped),
+            sequence: scoped?.sequence, data: null, request: null });
     }
     function dataReady(data, dryRun = false) {
         const frame = current();
@@ -21,7 +26,7 @@ export function createReplyFilter() {
     }
     function settingsReady(data) {
         const frame = current();
-        if (!frame?.eligible || !replyTypes.has(data?.type)) return false;
+        if (!frame?.eligible || !(replyTypes.has(data?.type) || frame.sequence && data?.type === 'quiet')) return false;
         const prompt = frame.data?.prompt;
         if (!Array.isArray(prompt) || !Array.isArray(data?.messages)) return false;
         const messages = prompt.filter(message => message && typeof message === 'object');
@@ -34,18 +39,32 @@ export function createReplyFilter() {
     }
     function take({ path, payload }) {
         const frame = current();
-        if (!frame?.request || !replyTypes.has(payload?.type)) return false;
+        if (!frame?.request || !(replyTypes.has(payload?.type) || frame.sequence && payload?.type === 'quiet')) return false;
         const chat = Array.isArray(frame.data?.prompt);
         if (chat !== (path === '/api/backends/chat-completions/generate')) return false;
         if (serialize(frame.request) !== serialize(payload)) return false;
         frame.data = null;
         frame.request = null;
-        return true;
+        return frame.sequence ? { sequence: frame.sequence } : true;
+    }
+    async function captureQuiet(sequence, prompt, action) {
+        if (capture) throw new Error('이미 답장 재작성을 연결 중입니다.');
+        const pending = { sequence, prompt, used: false };
+        capture = pending;
+        try { return await action(); }
+        finally {
+            if (capture === pending) capture = null;
+            // A stopped/failed generation may omit ENDED. It must not leave
+            // permission for a later unrelated quiet request.
+            for (const frame of frames) if (frame.sequence === sequence) {
+                frame.request = null; frame.data = null;
+            }
+        }
     }
     function generationEnded() { frames.pop(); }
     function consume() { const frame = current(); if (frame) { frame.request = null; frame.data = null; } }
-    function clear() { frames.length = 0; }
-    return { generationStarted, dataReady, settingsReady, take, consume, generationEnded, clear };
+    function clear() { frames.length = 0; capture = null; }
+    return { generationStarted, dataReady, settingsReady, take, consume, captureQuiet, generationEnded, clear };
 }
 
 export function createWarningGate(now = Date.now, interval = 30000) {

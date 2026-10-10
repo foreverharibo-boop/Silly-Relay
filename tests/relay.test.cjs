@@ -1315,3 +1315,167 @@ test('nested quiet helper cannot consume the pending native reply recovery sessi
     page.recovery.stop(); await (await b.makePage()).recovery.recover();
     assert.equal(b.disk.messages[1].mes, 'main survives helper');
 });
+
+async function reviewedReply(t, { ttotto = false, mode = 'normal', stream = false, saveDraft = false, unfilledSwipe = false } = {}) {
+    const f = await fixture(t), b = await recoveryBrowser(t, f);
+    if (mode === 'swipe') seedSwipes(b);
+    const page = await b.makePage();
+    const { createReplyFilter } = await import('../reply-filter.mjs');
+    const { createReplySessions } = await import('../reply-session.mjs');
+    const { createTransport } = await import('../transport.mjs');
+    const filter = createReplyFilter();
+    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch,
+        shouldRelay: filter.take, prepareRecovery: data => page.recovery.prepare(data),
+        onEvent: (type, data) => page.recovery.event(type, data) });
+    const sessions = createReplySessions({ enabled: () => true, recovery: page.recovery, transport,
+        consume: filter.consume, captureQuiet: filter.captureQuiet });
+    if (mode === 'swipe') armSwipe(page); else page.arm();
+    filter.generationStarted(mode);
+    const prompt = [{ role: 'user', content: 'native reply' }]; filter.dataReady({ prompt });
+    const body = { type: mode, messages: prompt.filter(Boolean), duration: stream ? 60 : 5, stream, testReply: 'native draft' };
+    filter.settingsReady(body); page.recovery.settingsReady(body);
+    const send = (fetcher, data) => fetcher(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(data) });
+    let response, text = 'native draft';
+    if (ttotto) {
+        const session = sessions.begin();
+        await (await send(session.fetch, body)).text();
+        text = 'ttotto revised draft';
+        response = await send(session.fetch, { ...body, testReply: text }); await response.text(); session.complete(response);
+    } else { response = await send(transport.fetch, body); await response.text(); }
+    let message;
+    if (mode === 'swipe') {
+        message = page.ctx.chat.at(-1); message.mes = text;
+        // Non-streaming ST invokes received hooks with an unfilled new slot
+        // and the previous candidate's top-level extra still on the message.
+        if (unfilledSwipe) message.swipes.length++;
+        else { message.swipes.push(text); message.swipe_info.push({ extra: {} }); }
+    } else {
+        message = { name: 'Character', is_user: false, mes: text, send_date: 'native-date',
+            extra: {}, swipe_id: 0, swipes: [text], swipe_info: [{ extra: {} }] };
+        page.ctx.chat.push(message);
+    }
+    if (saveDraft) { page.recovery.tag(page.ctx.chat.length - 1, true); await page.ctx.saveChat(); }
+    if (stream) { filter.generationEnded(); page.recovery.generationEnded(); }
+    const controller = new AbortController();
+    const review = sessions.beginReview(page.ctx.chat.length - 1, message, controller.signal);
+    assert.ok(review);
+    async function quiet(promptText, testReply, extras = {}) {
+        filter.generationStarted('quiet', { quiet_prompt: promptText });
+        page.recovery.generationStarted('quiet', { quiet_prompt: promptText });
+        const prompt = [{ role: 'user', content: promptText }];
+        filter.dataReady({ prompt }); page.recovery.dataReady({}, false);
+        const body = { type: 'quiet', messages: prompt.filter(Boolean), testReply, duration: 5, ...extras };
+        filter.settingsReady(body);
+        try {
+            const response = await send(transport.fetch, body);
+            const raw = await response.text();
+            if (!response.ok) throw Error('rewrite failed');
+            if (body.stream) return JSON.parse(raw.split('\n\n')[0].slice(6)).choices[0].delta.content;
+            return JSON.parse(raw).choices[0].message.content;
+        } finally { filter.generationEnded(); page.recovery.generationEnded(); }
+    }
+    const publish = text => {
+        message.mes = text; message.swipes[message.swipe_id] = text;
+        review.completeMessage(message);
+    };
+    return { f, b, page, filter, transport, sessions, review, controller, message, quiet, publish };
+}
+
+for (const ttotto of [false, true]) for (const stream of [false, true]) for (const mode of ['normal', 'swipe']) {
+    test(`100LOG final rewrite restores once: ttotto=${ttotto}, stream=${stream}, mode=${mode}`, async t => {
+        const h = await reviewedReply(t, { ttotto, stream, mode, saveDraft: true });
+        const before = structuredClone(h.b.disk.messages);
+        const final = await h.review.capture('100LOG correction', () => h.quiet('100LOG correction', '100LOG final answer'));
+        assert.equal(final, '100LOG final answer');
+        assert.equal(h.page.recovery.list().length, 1);
+        assert.equal(h.page.recovery.list()[0].jobs.length, ttotto ? 3 : 2);
+        await h.page.recovery.settle();
+        for (const job of h.page.recovery.list()[0].jobs) assert.equal((await h.f.request(`/jobs/${job.id}`)).status, 200);
+        h.page.recovery.stop();
+        const fresh = await h.b.makePage(); await fresh.recovery.recover();
+        assert.equal(h.b.disk.messages.length, 2);
+        assert.equal(h.b.disk.messages[1].mes, '100LOG final answer');
+        if (mode === 'swipe') {
+            assert.deepEqual(h.b.disk.messages[1].swipes.slice(0, 2), before[1].swipes.slice(0, 2));
+            assert.deepEqual(h.b.disk.messages[1].swipe_info.slice(0, 2), before[1].swipe_info.slice(0, 2));
+            assert.equal(h.b.disk.messages[1].swipes.length, 3);
+        }
+        assert.equal(fresh.recovery.list().length, 0);
+        await (await h.b.makePage()).recovery.recover();
+        assert.equal(h.b.disk.messages.length, 2); assert.equal(h.f.calls.length, ttotto ? 3 : 2);
+    });
+}
+
+test('100LOG scope excludes memory/JEV/translation helpers and clears its permission', async t => {
+    const h = await reviewedReply(t);
+    const result = await h.review.capture('actual correction', async () => {
+        await h.quiet('collect memories', 'memory result');
+        await h.quiet('judge conflicts', 'judge result');
+        const result = await h.quiet('actual correction', 'revised character reply');
+        await h.quiet('translate', 'translation result');
+        return result;
+    });
+    assert.equal(h.page.recovery.list()[0].jobs.length, 2);
+    await h.quiet('actual correction', 'outside scope');
+    assert.equal(h.page.recovery.list()[0].jobs.length, 2);
+    h.publish(result); await h.page.ctx.saveChat(); await h.page.recovery.settle();
+    assert.equal(h.b.disk.messages[1].mes, 'revised character reply');
+    assert.equal(h.page.recovery.list().length, 0); assert.equal(h.f.calls.length, 6);
+});
+
+test('100LOG pass or failed rewrite keeps the exact selected Ttotto answer', async t => {
+    for (const fail of [false, true]) {
+        const h = await reviewedReply(t, { ttotto: true, stream: true });
+        if (fail) await assert.rejects(() => h.review.capture('correction', () => h.quiet('correction', '', { error: true })));
+        h.publish(h.message.mes);
+        h.page.recovery.stop(); await (await h.b.makePage()).recovery.recover();
+        assert.equal(h.b.disk.messages[1].mes, 'ttotto revised draft');
+    }
+});
+
+test('100LOG retry keeps one logical reply and selects the successful rewrite', async t => {
+    const h = await reviewedReply(t);
+    await assert.rejects(() => h.review.capture('correction', () => h.quiet('correction', '', { error: true })));
+    const text = await h.review.capture('correction', () => h.quiet('correction', 'successful retry'));
+    h.publish(text); h.page.recovery.stop(); await (await h.b.makePage()).recovery.recover();
+    assert.equal(h.b.disk.messages[1].mes, 'successful retry'); assert.equal(h.f.calls.length, 3);
+});
+
+test('100LOG stop cancels active rewrite and prevents late recovery; manual edit remains protected', async t => {
+    const h = await reviewedReply(t, { saveDraft: true });
+    let accepted;
+    const ready = new Promise(resolve => { accepted = resolve; });
+    const pending = h.review.capture('correction', async () => {
+        const task = h.quiet('correction', 'late text', { stream: true, duration: 400 });
+        while (h.page.recovery.list()[0]?.jobs.length < 2) await delay(5);
+        while (h.f.calls.length < 2) await delay(5);
+        accepted(); return task;
+    });
+    const rejected = assert.rejects(pending, { name: 'AbortError' });
+    await ready; h.controller.abort(); h.review.cancel(); await rejected;
+    h.page.recovery.stop(); await (await h.b.makePage()).recovery.recover();
+    assert.equal(h.b.disk.messages[1].mes, 'native draft');
+    await delay(30); assert.equal(h.f.calls[1].cancelled, true);
+    const edited = await reviewedReply(t, { saveDraft: true });
+    await edited.review.capture('correction', () => edited.quiet('correction', 'must not overwrite edit'));
+    edited.b.disk.messages[1].mes = 'manual edit'; edited.page.recovery.stop();
+    await (await edited.b.makePage()).recovery.recover();
+    assert.equal(edited.b.disk.messages[1].mes, 'manual edit');
+});
+
+test('100LOG cannot adopt an unrelated message or a message with no pending relay record', async t => {
+    const h = await reviewedReply(t);
+    assert.equal(h.sessions.beginReview(1, { ...h.message }), null);
+    h.review.cancel(); assert.equal(h.sessions.beginReview(1, h.message), null);
+});
+
+test('100LOG swipe adoption works before the native receive hook tags or saves the new slot', async t => {
+    for (const ttotto of [false, true]) {
+        const h = await reviewedReply(t, { mode: 'swipe', ttotto, saveDraft: false, unfilledSwipe: true });
+        await h.review.capture('correction', () => h.quiet('correction', 'unsaved revised swipe'));
+        h.page.recovery.stop(); await (await h.b.makePage()).recovery.recover();
+        assert.equal(h.b.disk.messages[1].mes, 'unsaved revised swipe');
+        assert.equal(h.b.disk.messages[1].swipes.length, 3);
+        assert.deepEqual(h.b.disk.messages[1].swipes.slice(0,2), ['이전 후보 하나','이전 후보 둘']);
+    }
+});

@@ -1,8 +1,8 @@
-import { createTransport } from './transport.mjs?v=1.0.7';
-import { createRecovery } from './recovery.mjs?v=1.0.7';
-import { recoveryIdentity } from './identity.mjs?v=1.0.7';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.7';
-import { createReplySessions } from './reply-session.mjs?v=1.0.7';
+import { createTransport } from './transport.mjs?v=1.0.8';
+import { createRecovery } from './recovery.mjs?v=1.0.8';
+import { recoveryIdentity } from './identity.mjs?v=1.0.8';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.8';
+import { createReplySessions } from './reply-session.mjs?v=1.0.8';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -73,7 +73,7 @@ async function check() {
         const result = await transport.api('/status', { headers: headers() });
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.7 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.8 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -119,7 +119,7 @@ function initialize() {
         } });
     hook = transport.fetch;
     globalThis.sillyRelayReplies = createReplySessions({ enabled: () => active && !!tabId,
-        recovery, transport, consume: replies.consume,
+        recovery, transport, consume: replies.consume, captureQuiet: replies.captureQuiet,
         onError: error => onEvent('recovery-unavailable', { message: error.message || '수정본 복구 기록 실패' }) });
     globalThis.fetch = hook;
     panel = document.createElement('div');

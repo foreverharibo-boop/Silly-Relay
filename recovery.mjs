@@ -34,10 +34,11 @@ function swipeAnchor(message, count) {
         swipes: variants(message).slice(0, count) }]);
 }
 function completedPosition(record, chat) {
+    const matches = mark => mark?.id === record.id && mark.complete
+        && (!record.revision || mark.revision === record.revision);
     for (let index = 0; index < chat.length; index++) {
         const message = chat[index];
-        if (message.extra?.[MARK]?.id === record.id && message.extra[MARK].complete
-            || message.swipe_info?.some(info => info?.extra?.[MARK]?.id === record.id && info.extra[MARK].complete)) {
+        if (matches(message.extra?.[MARK]) || message.swipe_info?.some(info => matches(info?.extra?.[MARK]))) {
             return { done: true, index };
         }
     }
@@ -158,6 +159,16 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (done) return done;
         const existing = chat.findIndex(m => m.extra?.[MARK]?.id === record.id);
         if (fingerprint(chat.slice(0, record.count)) !== record.anchor) return null;
+        const hasReviewTarget = record.reviewBase && chat[record.count]
+            && (!isSwipe(record) || variants(chat[record.count]).length > record.swipeCount);
+        if (hasReviewTarget
+            && fingerprint([chat[record.count]]) !== record.reviewBase) return null;
+        if (hasReviewTarget && chat.length === record.count + 1
+            && !chat[record.count].is_user && !chat[record.count].is_system) {
+            // Some native paths saved the received draft before our receive
+            // hook could tag it. Require the exact known draft, not text alone.
+            return { done: false, index: record.count };
+        }
         if (isSwipe(record)) {
             const message = chat[record.count];
             if (chat.length !== record.count + 1 || !message || message.is_user || message.is_system
@@ -241,9 +252,15 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return true;
     }
     async function receipt(record) {
+        if (record.reviewing && !record.finalized) return false;
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
+        // A receive hook can promote a completed draft while this read is in
+        // flight. An old draft receipt must not release its newer revision.
+        const current = allRecords().find(r => r.id === record.id);
+        if (!current || current.revision !== record.revision || current.jobId !== record.jobId
+            || current.reviewing && !current.finalized) return false;
         if (!completedPosition(record, saved)) return false;
         if (!showSaved(record, saved)) return false;
         if (record.jobs && !record.finalized && live.has(record.id)) return false;
@@ -283,6 +300,61 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         sequences.add(sequence);
         return sequence;
     }
+    function beginReview(index, message, signal) {
+        const ctx = getContext(), identity = chatIdentity(ctx);
+        if (!identity || signal?.aborted || ctx.chat[index] !== message || ctx.chat.length !== index + 1
+            || message.is_user || message.is_system) return null;
+        const candidates = list().filter(record => {
+            // Native non-streaming swipes inherit the PREVIOUS candidate's
+            // message.extra until receive hooks finish. Inspect the new slot.
+            const markedId = isSwipe(record) ? message.swipe_info?.[record.swipeCount]?.extra?.[MARK]?.id
+                : message.extra?.[MARK]?.id;
+            return record.count === index && sameChat(record.identity, identity)
+                && !record.reviewing && (!markedId || markedId === record.id)
+                && fingerprint(ctx.chat.slice(0, index)) === record.anchor
+                && (!isSwipe(record) || message.swipe_id === record.swipeCount
+                    && swipeAnchor(message, record.swipeCount) === record.swipeAnchor);
+        });
+        if (candidates.length !== 1) return null;
+        const original = candidates[0];
+        const jobs = original.jobs || [{ id: original.id, stream: original.stream, mainApi: original.mainApi,
+            source: original.source, includeReasoning: original.includeReasoning, model: original.model, bytes: original.bytes }];
+        const selectedId = original.selectedId || sourceId(original);
+        const record = { ...original, jobs, selectedId, jobId: selectedId, finalized: false, reviewing: true,
+            revision: (original.revision || 0) + 1, reviewBase: fingerprint([message]) };
+        change(record.id, record);
+        live.add(record.id);
+        const sequence = { id: record.id, closed: false, signal,
+            ticket: { armed: true, type: isSwipe(record) ? 'swipe' : 'normal', identity },
+            message, baseText: message.mes, baseId: selectedId, acceptedId: selectedId, acceptedText: message.mes };
+        sequences.add(sequence);
+        message.extra ||= {};
+        message.extra[MARK] = { id: record.id, complete: false, revision: record.revision };
+        const info = message.swipe_info?.[message.swipe_id ?? 0];
+        if (info) { info.extra ||= {}; info.extra[MARK] = { ...message.extra[MARK] }; }
+        return sequence;
+    }
+    function acceptReview(sequence, text, previousId) {
+        if (!sequences.has(sequence) || sequence.closed || typeof text !== 'string' || !text.trim()) return;
+        if (sequence.latestId && sequence.latestId !== previousId) {
+            sequence.acceptedId = sequence.latestId; sequence.acceptedText = text;
+        }
+    }
+    function completeReview(sequence, message) {
+        if (!sequences.has(sequence) || sequence.closed) return;
+        const record = list().find(r => r.id === sequence.id);
+        if (!record || getContext()?.chat?.[record.count] !== message || sequence.message !== message
+            || !sameChat(chatIdentity(getContext()), record.identity) || sequence.signal?.aborted) {
+            cancelSequence(sequence); return;
+        }
+        const selected = message.mes === sequence.acceptedText ? sequence.acceptedId
+            : message.mes === sequence.baseText ? sequence.baseId : null;
+        if (!selected) { cancelSequence(sequence); return; }
+        completeSequence(sequence, selected);
+        live.add(record.id);
+        tag(record.count, true);
+        setTimeout(() => { if (!stopped) void settle(); }, 500);
+    }
     function completeSequence(sequence, selectedId) {
         if (!sequences.has(sequence) || sequence.closed) return;
         sequence.closed = true;
@@ -290,7 +362,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!record) return;
         const selected = record.jobs.find(job => job.id === selectedId);
         if (selected) change(record.id, { ...record, ...selected, id: record.id,
-            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true });
+            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false });
         // No selected response means an interrupted review. Keep the journal;
         // recovery can select the newest complete, readable candidate.
         else live.delete(record.id);
@@ -341,7 +413,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             const job = { id, stream: record.stream, mainApi: record.mainApi, source: record.source,
                 includeReasoning: record.includeReasoning, model: record.model, bytes: null };
             record = { ...(root || record), ...job, id: root?.id || id, jobId: id,
-                jobs: [...(root?.jobs || []), job], finalized: false };
+                jobs: [...(root?.jobs || []), job], selectedId: null, finalized: false };
         }
         // ST already saves a normal user message before generating. Do not call
         // saveChat or read the entire chat on this critical path: a delayed save,
@@ -355,7 +427,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             throw error;
         }
         live.add(record.id);
-        if (sequence) sequence.id = record.id;
+        if (sequence) { sequence.id = record.id; sequence.latestId = id; }
         return true;
     }
     function event(type, data) {
@@ -403,7 +475,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             message.extra ||= {};
             const canComplete = complete && (!record.jobs || record.finalized);
             const alreadyComplete = message.extra[MARK]?.id === record.id && message.extra[MARK].complete;
-            message.extra[MARK] = { id: record.id, complete: !!canComplete || !!alreadyComplete };
+            message.extra[MARK] = { id: record.id, complete: !!canComplete || !!alreadyComplete,
+                ...(record.revision ? { revision: record.revision } : {}) };
             const info = message.swipe_info?.[message.swipe_id ?? 0];
             if (info) { info.extra ||= {}; info.extra[MARK] = { ...message.extra[MARK] }; }
         }
@@ -471,7 +544,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             try { reply = decodeReply(data.raw, data.record, decoding); }
             catch (error) { lastError = error; continue; }
             if (record.jobs) {
-                data.record = { ...data.record, selectedId: job.id, finalized: true };
+                data.record = { ...data.record, selectedId: job.id, finalized: true, reviewing: false };
                 change(record.id, data.record);
             }
             return { ...data, reply };
@@ -509,7 +582,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
                 extra: { api: 'openai', model: record.model,
                     reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
-                    reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true } },
+                    reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
+                        ...(record.revision ? { revision: record.revision } : {}) } },
                 swipe_id: 0, swipes: [text] };
             message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
                 gen_finished: message.gen_finished, extra: JSON.parse(JSON.stringify(message.extra)) }];
@@ -658,6 +732,6 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
     }
     function stop() { stopped = true; }
-    return { beginSequence, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
+    return { beginSequence, beginReview, acceptReview, completeReview, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }
 
