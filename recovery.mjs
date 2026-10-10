@@ -98,9 +98,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     formatReply = async text => text, parser = async () => ({}), notify = () => {}, diagnostic = () => {},
     isVisible = () => true, allowPreviousSession = false }) {
     let owner = null, ticket = null, generating = false, busy = false;
+    const generationParents = [];
     const live = new Set();
     const warned = new Set();
     const receipts = new Map();
+    const sequences = new WeakSet();
+    const sources = record => record.jobs || [record];
+    const sourceId = record => record.jobId || record.id;
     let stopped = false;
     const storageKey = () => `${KEY}:${owner}`;
     function allRecords() {
@@ -219,23 +223,31 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         notify('채팅 파일에 저장된 답장을 화면에 불러왔어요.', true);
         return true;
     }
+    async function release(record) {
+        // The logical reply owns every draft buffer. Release them only after
+        // the selected reply has a durable chat receipt, never after a draft.
+        for (const job of sources(record)) {
+            try {
+                const jobId = sourceId(job);
+                const info = await api(`/jobs/${jobId}?cursor=0`, { headers: getHeaders() });
+                if (info.state === 'running') return false;
+                if (info.state !== 'completed') continue;
+                await api(`/jobs/${jobId}/ack`, { method: 'POST', headers: getHeaders(),
+                    body: JSON.stringify({ cursor: info.bytes }) });
+            } catch (error) {
+                if (![404, 410].includes(error.httpStatus)) throw error;
+            }
+        }
+        return true;
+    }
     async function receipt(record) {
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
         if (!completedPosition(record, saved)) return false;
         if (!showSaved(record, saved)) return false;
-        try {
-            if (!Number.isSafeInteger(record.bytes)) {
-                const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
-                if (info.state !== 'completed') return false;
-                record = { ...record, bytes: info.bytes };
-            }
-            await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
-                body: JSON.stringify({ cursor: record.bytes }) });
-        } catch (error) {
-            if (![404, 410].includes(error.httpStatus)) throw error;
-        }
+        if (record.jobs && !record.finalized && live.has(record.id)) return false;
+        if (!await release(record)) return false;
         change(record.id, null);
         live.delete(record.id);
         return true;
@@ -248,6 +260,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         finally { receipts.delete(record.id); }
     }
     function generationStarted(type, options = {}, dryRun = false) {
+        generationParents.push({ ticket, generating });
         generating = !dryRun;
         ticket = !dryRun && !options.quietToLoud && [undefined, 'normal', 'regenerate', 'swipe'].includes(type)
             ? { type: type || 'normal', identity: chatIdentity(getContext()), armed: false } : null;
@@ -255,63 +268,115 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     function dataReady(_data, dryRun) { if (ticket && !dryRun) ticket.armed = true; }
     function requestFingerprint(data) {
         // Notification extensions may append their metadata after this event.
-        const { silly_pop_ios, silly_pop, ...payload } = data;
+        const { silly_pop_ios, silly_pop, silly_pop_and, __ttotto_main_request, ...payload } = data;
         return fingerprint([{ mes: JSON.stringify(payload) }]);
     }
     function settingsReady(data) {
         if (ticket?.armed && data && [undefined, 'normal', 'regenerate', 'swipe'].includes(data.type)) {
-            ticket.requestFingerprint = requestFingerprint(data);
+            ticket.request = data;
         }
     }
-    async function prepare({ id, path, body }) {
+    function beginSequence() {
+        if (!ticket?.armed || !sameChat(ticket.identity, chatIdentity(getContext()))) return null;
+        const sequence = { ticket, id: null, closed: false };
+        ticket = null;
+        sequences.add(sequence);
+        return sequence;
+    }
+    function completeSequence(sequence, selectedId) {
+        if (!sequences.has(sequence) || sequence.closed) return;
+        sequence.closed = true;
+        const record = list().find(r => r.id === sequence.id);
+        if (!record) return;
+        const selected = record.jobs.find(job => job.id === selectedId);
+        if (selected) change(record.id, { ...record, ...selected, id: record.id,
+            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true });
+        // No selected response means an interrupted review. Keep the journal;
+        // recovery can select the newest complete, readable candidate.
+        else live.delete(record.id);
+    }
+    function cancelSequence(sequence) {
+        if (!sequences.has(sequence)) return;
+        sequence.closed = true;
+        if (sequence.id) { change(sequence.id, null); live.delete(sequence.id); }
+    }
+    async function prepare({ id, path, body, sequence }) {
         const data = JSON.parse(body);
+        if (sequence && (!sequences.has(sequence) || sequence.closed)) return false;
+        const pending = sequence?.ticket || ticket;
+        const root = sequence?.id && list().find(r => r.id === sequence.id);
         // Never turn quiet/translation/review/tool requests into character messages.
-        if (!ticket?.armed || ![undefined, 'normal', 'regenerate', 'swipe'].includes(data.type)
+        if ((!root && !pending?.armed) || (!sequence && ![undefined, 'normal', 'regenerate', 'swipe'].includes(data.type))
             || path !== '/api/backends/chat-completions/generate' || (data.n || 1) > 1 || data.tools?.length) return false;
-        if ((data.type === 'swipe') !== (ticket.type === 'swipe') && data.type !== undefined) return false;
+        if (!sequence && (data.type === 'swipe') !== (pending.type === 'swipe') && data.type !== undefined) return false;
         // An untyped helper request (e.g. validation) must not steal the main
         // generation's journal. Legacy untyped main requests are bound by ST's
         // final request event, without adding fields to the outgoing payload.
-        if (data.type === undefined && ticket.requestFingerprint !== requestFingerprint(data)) return false;
-        const currentTicket = ticket;
-        ticket = null;
+        if (!sequence && data.type === undefined && (!pending.request || requestFingerprint(pending.request) !== requestFingerprint(data))) return false;
+        const currentTicket = pending;
+        if (!sequence) ticket = null;
         await identify();
         const ctx = getContext();
         const identity = chatIdentity(ctx);
         if (!sameChat(identity, currentTicket.identity)) return false;
+        if (root && (fingerprint(ctx.chat.slice(0, root.count)) !== root.anchor
+            || !sameChat(identity, root.identity))) return false;
         const swipe = currentTicket.type === 'swipe';
         const previous = ctx.chat[ctx.chat.length - 1];
-        if (swipe && (!previous || previous.is_user || previous.is_system || !Array.isArray(previous.swipes)
+        if (!root && swipe && (!previous || previous.is_user || previous.is_system || !Array.isArray(previous.swipes)
             || !previous.swipes.length || previous.swipe_id !== previous.swipes.length
             || previous.swipes.some(text => typeof text !== 'string'))) return false;
         const count = ctx.chat.length - (swipe ? 1 : 0);
-        const record = { id, tab: tabId, identity, count, anchor: fingerprint(ctx.chat.slice(0, count)),
+        let record = { id, tab: tabId, identity, count, anchor: fingerprint(ctx.chat.slice(0, count)),
             name: ctx.name2, created: Date.now(), stream: !!data.stream, mainApi: 'openai',
             source: data.chat_completion_source || ctx.chatCompletionSettings?.chat_completion_source,
             includeReasoning: typeof data.include_reasoning === 'boolean' ? data.include_reasoning
                 : ctx.chatCompletionSettings?.show_thoughts === true,
             model: typeof data.model === 'string' ? data.model : '', bytes: null };
-        if (swipe) {
+        if (!root && swipe) {
             record.swipeCount = previous.swipes.length;
             record.swipeAnchor = swipeAnchor(previous, record.swipeCount);
+        }
+        if (sequence) {
+            const job = { id, stream: record.stream, mainApi: record.mainApi, source: record.source,
+                includeReasoning: record.includeReasoning, model: record.model, bytes: null };
+            record = { ...(root || record), ...job, id: root?.id || id, jobId: id,
+                jobs: [...(root?.jobs || []), job], finalized: false };
         }
         // ST already saves a normal user message before generating. Do not call
         // saveChat or read the entire chat on this critical path: a delayed save,
         // older file header or other extension must not block answer generation.
         // The strict disk/chat checks still run before recovery writes and ACKs.
         try {
-            change(id, record);
-            if (!list().some(r => r.id === id)) throw new Error('브라우저에 복구 정보를 기록하지 못했습니다.');
+            change(record.id, record);
+            if (!list().some(r => r.id === record.id)) throw new Error('브라우저에 복구 정보를 기록하지 못했습니다.');
         } catch (error) {
-            try { change(id, null); } catch { /* Storage may be unavailable. */ }
+            try { if (!root) change(record.id, null); } catch { /* Storage may be unavailable. */ }
             throw error;
         }
-        live.add(id);
+        live.add(record.id);
+        if (sequence) sequence.id = record.id;
         return true;
     }
     function event(type, data) {
-        const record = list().find(r => r.id === data.id);
+        const record = list().find(r => r.id === data.id || r.jobs?.some(job => job.id === data.id));
         if (!record) return;
+        if (record.jobs) {
+            if (type === 'completed' && (data.status < 200 || data.status >= 300)
+                && record.finalized && record.selectedId === data.id) {
+                // The first generation itself failed: ST receives the native
+                // error and there is no character reply awaiting a chat save.
+                change(record.id, null); live.delete(record.id); return;
+            }
+            const jobs = record.jobs.map(job => job.id === data.id
+                ? { ...job, ...(type === 'completed' ? { bytes: data.bytes, status: data.status } : {}),
+                    ...(['cancelled', 'cancel-pending'].includes(type) || type === 'error' && data.httpStatus
+                        ? { failed: true } : {}) } : job);
+            change(record.id, { ...record, jobs });
+            // A failed revision must not erase its previous good draft.
+            // The explicit session completes/cancels the logical reply.
+            return;
+        }
         if (type === 'recovery-unavailable') {
             live.delete(record.id);
             try { change(record.id, null); } catch { /* Storage may be unavailable. */ }
@@ -336,8 +401,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             if (isSwipe(record) && (message.swipe_id !== record.swipeCount
                 || swipeAnchor(message, record.swipeCount) !== record.swipeAnchor)) continue;
             message.extra ||= {};
+            const canComplete = complete && (!record.jobs || record.finalized);
             const alreadyComplete = message.extra[MARK]?.id === record.id && message.extra[MARK].complete;
-            message.extra[MARK] = { id: record.id, complete: !!complete || !!alreadyComplete };
+            message.extra[MARK] = { id: record.id, complete: !!canComplete || !!alreadyComplete };
             const info = message.swipe_info?.[message.swipe_id ?? 0];
             if (info) { info.extra ||= {}; info.extra[MARK] = { ...message.extra[MARK] }; }
         }
@@ -354,10 +420,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         let cursor = 0, state;
         for (;;) {
             if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity) || generating) return null;
-            state = await api(`/jobs/${record.id}?cursor=${cursor}&wait=1`, { headers: getHeaders() });
+            state = await api(`/jobs/${sourceId(record)}?cursor=${cursor}&wait=1`, { headers: getHeaders() });
             if (['failed', 'cancelled'].includes(state.state)) {
-                change(record.id, null);
-                throw new Error(state.error || '생성이 중지되었습니다.');
+                if (!record.jobs) change(record.id, null);
+                throw Object.assign(new Error(state.error || '생성이 중지되었습니다.'), { candidateFailed: true });
             }
             if (state.cursor !== cursor || state.next < cursor) throw new Error('복구 응답 위치가 일치하지 않습니다.');
             const bytes = Uint8Array.from(atob(state.data), c => c.charCodeAt(0));
@@ -368,17 +434,52 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (state.status < 200 || state.status >= 300) {
             // An HTTP error has no chat message to save. Release it only after
             // the full error response has been read, just like the live path.
-            await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
+            await api(`/jobs/${sourceId(record)}/ack`, { method: 'POST', headers: getHeaders(),
                 body: JSON.stringify({ cursor }) });
-            change(record.id, null); live.delete(record.id);
-            throw new Error(`AI 요청이 실패했습니다 (HTTP ${state.status}).`);
+            if (!record.jobs) { change(record.id, null); live.delete(record.id); }
+            throw Object.assign(new Error(`AI 요청이 실패했습니다 (HTTP ${state.status}).`), { candidateFailed: true });
         }
         const joined = new Uint8Array(cursor);
         let offset = 0;
         for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
         record = { ...record, bytes: cursor };
-        change(record.id, record);
+        if (!record.jobs) change(record.id, record);
         return { record, raw: new TextDecoder().decode(joined), finishedAt: state.finishedAt };
+    }
+    async function readLatest(record) {
+        const decoding = { ...await parser(),
+            showThoughts: getContext()?.chatCompletionSettings?.show_thoughts === true };
+        const candidates = record.jobs
+            ? (record.selectedId ? record.jobs.filter(job => job.id === record.selectedId) : [...record.jobs].reverse())
+            : [record];
+        let lastError;
+        for (const job of candidates) {
+            if (job.failed || job.status && (job.status < 200 || job.status >= 300)) {
+                lastError = new Error('재작성 요청이 완료되지 않아 이전 답장을 확인합니다.');
+                continue;
+            }
+            const candidate = record.jobs ? { ...record, ...job, id: record.id, jobId: job.id } : record;
+            let data;
+            try { data = await readReply(candidate); }
+            catch (error) {
+                // Network uncertainty is never evidence to fall back to a draft.
+                if (!error.candidateFailed) throw error;
+                lastError = error; continue;
+            }
+            if (!data) return null;
+            let reply;
+            try { reply = decodeReply(data.raw, data.record, decoding); }
+            catch (error) { lastError = error; continue; }
+            if (record.jobs) {
+                data.record = { ...data.record, selectedId: job.id, finalized: true };
+                change(record.id, data.record);
+            }
+            return { ...data, reply };
+        }
+        if (record.jobs && await release(record)) {
+            change(record.id, null); live.delete(record.id);
+        }
+        throw lastError || new Error('복구할 완료 답장이 없습니다.');
     }
     async function apply(record, reply, finishedAt) {
         let ctx = getContext();
@@ -394,12 +495,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
             // Already durable AND visible. Release only this response, with no
             // chat write, replayed hooks or misleading recovery success toast.
-            try {
-                await api(`/jobs/${record.id}/ack`, { method: 'POST', headers: getHeaders(),
-                    body: JSON.stringify({ cursor: record.bytes }) });
-            } catch (error) {
-                if (![404, 410].includes(error.httpStatus)) throw error;
-            }
+            if (!await release(record)) return false;
             change(record.id, null);
             live.delete(record.id);
             return true;
@@ -464,11 +560,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             for (const record of list()) {
                 if (live.has(record.id) || !sameChat(chatIdentity(getContext()), record.identity)) continue;
                 try {
-                    const data = await readReply(record);
+                    const data = await readLatest(record);
                     if (!data) continue;
-                    const reply = decodeReply(data.raw, data.record, { ...await parser(),
-                        showThoughts: getContext()?.chatCompletionSettings?.show_thoughts === true });
-                    await apply(data.record, reply, data.finishedAt);
+                    await apply(data.record, data.reply, data.finishedAt);
                 } catch (error) {
                     if ([404, 410].includes(error.httpStatus)) {
                         // Another page/receipt may have ACKed while this read was
@@ -526,7 +620,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 throw new Error('원래 채팅과 현재 내용이 달라 복구를 멈췄어요. 기존 메시지는 변경하지 않았어요.');
             }
             if (await acknowledge(record)) return;
-            const info = await api(`/jobs/${record.id}?cursor=0`, { headers: getHeaders() });
+            const info = await api(`/jobs/${sourceId(record)}?cursor=0`, { headers: getHeaders() });
             if (info.state === 'running') throw new Error('서버에서 아직 답장을 받고 있어요. 완료된 뒤 다시 눌러 주세요.');
             if (info.state !== 'completed' || info.status < 200 || info.status >= 300) {
                 throw new Error('서버에 복구할 완료 답장이 없어요.');
@@ -548,10 +642,15 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (adopted) await recover({ manual: true });
     }
     function generationEnded() {
-        generating = false; ticket = null;
+        const parent = generationParents.pop();
+        generating = parent?.generating || false; ticket = parent?.ticket || null;
+        // The guard has returned its selected response. Allow recovery to
+        // validate it if ST could not render/save it (e.g. a provider error).
+        for (const record of list()) if (record.jobs && record.finalized) live.delete(record.id);
         setTimeout(() => { if (!stopped) void settle(); }, 500);
     }
     function generationStopped() {
+        generationParents.length = 0;
         generationEnded();
         for (const record of list()) {
             if (!live.has(record.id)) continue;
@@ -559,5 +658,6 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         }
     }
     function stop() { stopped = true; }
-    return { prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
+    return { beginSequence, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }
+

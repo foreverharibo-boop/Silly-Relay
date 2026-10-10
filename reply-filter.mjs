@@ -3,7 +3,7 @@
 // Keep object references only for the current generation; never add wire fields.
 const replyTypes = new Set([undefined, 'normal', 'regenerate', 'swipe', 'continue']);
 const serialize = data => JSON.stringify(data, (key, value) =>
-    ['silly_pop', 'silly_pop_ios', 'silly_pop_and'].includes(key) ? undefined : value);
+    ['silly_pop', 'silly_pop_ios', 'silly_pop_and', '__ttotto_main_request'].includes(key) ? undefined : value);
 
 export function createReplyFilter() {
     const frames = [];
@@ -43,8 +43,9 @@ export function createReplyFilter() {
         return true;
     }
     function generationEnded() { frames.pop(); }
+    function consume() { const frame = current(); if (frame) { frame.request = null; frame.data = null; } }
     function clear() { frames.length = 0; }
-    return { generationStarted, dataReady, settingsReady, take, generationEnded, clear };
+    return { generationStarted, dataReady, settingsReady, take, consume, generationEnded, clear };
 }
 
 export function createWarningGate(now = Date.now, interval = 30000) {

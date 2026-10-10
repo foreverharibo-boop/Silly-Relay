@@ -20,6 +20,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
     shouldRelay = () => false,
     saveCancellation = () => {}, prepareRecovery = async () => false,
     requestTimeout = 30000, retryDelay = 1000, startRetryMs = 60000 }) {
+    const replySequence = Symbol('silly-relay.reply-sequence');
     function emit(type, detail = {}) { try { onEvent(type, detail); } catch { /* UI never owns the request. */ } }
     async function api(path, init = {}) {
         const controller = new AbortController();
@@ -37,7 +38,8 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             throw error;
         } finally { clearTimeout(timer); }
     }
-    async function wrappedFetch(input, init) {
+    async function wrappedFetch(input, init, sequence) {
+        sequence ||= init?.[replySequence];
         const request = input instanceof Request ? input : null;
         let url;
         try { url = new URL(request ? request.url : String(input), origin); }
@@ -55,7 +57,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         try { payload = JSON.parse(body); }
         catch { return fetchImpl(input, init); }
         let isReply = false;
-        try { isReply = shouldRelay({ path: url.pathname, payload }) === true; }
+        try { isReply = !!sequence || shouldRelay({ path: url.pathname, payload }) === true; }
         catch { /* Unknown requests retain the original transport. */ }
         if (!isReply) return fetchImpl(input, init);
         const signal = init?.signal ?? request?.signal;
@@ -67,7 +69,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         // Persist the binding BEFORE submitting a billable request. Recoverable replies
         // are acknowledged by the chat layer only after the saved message is verified.
         let retainForRecovery = false;
-        try { retainForRecovery = await prepareRecovery({ id, path: url.pathname, body }); }
+        try { retainForRecovery = await prepareRecovery({ id, path: url.pathname, body, sequence }); }
         catch (error) {
             // Recovery is optional. A failed journal/capability check must never
             // suppress the one original AI request or retry it by another route.
@@ -193,6 +195,13 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         }
     }
     Object.defineProperty(wrappedFetch, '__sillyRelay', { value: true });
-    return { fetch: wrappedFetch, api };
+    // Only the explicit reply-session API supplies a sequence. Ordinary fetch
+    // callers cannot accidentally classify helpers by adding payload fields.
+    const fetch = (input, init) => wrappedFetch(input, init);
+    Object.defineProperty(fetch, '__sillyRelay', { value: true });
+    const replyFetch = (input, init, sequence, upstream) => typeof upstream === 'function'
+        ? upstream(input, { ...init, [replySequence]: sequence })
+        : wrappedFetch(input, init, sequence);
+    return { fetch, replyFetch, api };
 }
 

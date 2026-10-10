@@ -99,3 +99,19 @@ test('capacity warnings are bounded while other failures and later warnings rema
     now = 30000;
     assert.equal(gate('relay-capacity'), true);
 });
+
+
+test('observing native payload before a cooperating extension clones messages preserves the final binding', async () => {
+    const { createReplyFilter } = await import('../reply-filter.mjs');
+    const filter = createReplyFilter();
+    const prompt = [{ role: 'user', content: 'main' }];
+    filter.generationStarted(); filter.dataReady({ prompt });
+    const payload = { messages: prompt.filter(Boolean) };
+    assert.equal(filter.settingsReady(payload), true);
+    payload.messages = payload.messages.map(m => ({ ...m }));
+    payload.messages.push({ role: 'system', content: 'injected rule' });
+    payload.__ttotto_main_request = 'local provenance';
+    const sent = clone(payload); delete sent.__ttotto_main_request;
+    assert.equal(take(filter, sent), true);
+    assert.equal(take(filter, sent), false);
+});

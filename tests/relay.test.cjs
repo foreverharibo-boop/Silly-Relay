@@ -39,12 +39,12 @@ async function fixture(t, limits = {}, network = {}) {
                 call.finished = true;
                 if (req.body.error) return res.status(429).json({ error: { message: 'rate limited' } });
                 if (req.body.stream) res.end('data: [DONE]\n\n');
-                else res.json({ choices: [{ message: { content: '서버가 끝까지 받은 답장 🤍', reasoning_content: req.body.testReasoning || '' } }] });
+                else res.json({ choices: [{ message: { content: req.body.testReply ?? '서버가 끝까지 받은 답장 🤍', reasoning_content: req.body.testReasoning || '' } }] });
             };
             const timer = setTimeout(finish, req.body.duration || 180);
             if (req.body.stream) {
                 res.setHeader('Content-Type', 'text/event-stream');
-                const utf8 = Buffer.from('data: {"choices":[{"delta":{"content":"안녕 🤍"}}]}\n\n');
+                const utf8 = Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: req.body.testReply ?? '안녕 🤍' } }] }) + '\n\n');
                 // Split a multibyte Unicode sequence across server writes.
                 res.write(utf8.subarray(0, 45));
                 setTimeout(() => { if (!res.destroyed) res.write(utf8.subarray(45)); }, 30);
@@ -261,8 +261,16 @@ test('completed results expire; missing jobs are never regenerated', async t => 
     const f = await fixture(t, { retentionMs: 30 });
     const jobId = id();
     await f.start(jobId, { duration: 30 });
-    await delay(100);
-    assert.equal((await f.request(`/jobs/${jobId}`)).status, 404);
+    // Under a busy event loop the generation timer may run late too. Observe
+    // actual expiry instead of assuming it completed 70 ms before this check.
+    let status;
+    const deadline = Date.now() + 2000;
+    do {
+        status = (await f.request(`/jobs/${jobId}`)).status;
+        if (status === 404) break;
+        await delay(10);
+    } while (Date.now() < deadline);
+    assert.equal(status, 404);
     assert.equal(f.calls.length, 1);
 });
 
@@ -1133,3 +1141,177 @@ test('capacity diagnostics distinguish active generations from retained replies'
     assert.equal((await f.get(jobId)).state, 'completed');
 });
 
+
+
+async function replySession(page) {
+    const { createReplySessions } = await import('../reply-session.mjs');
+    return createReplySessions({ enabled: () => true, recovery: page.recovery, transport: page.transport }).begin();
+}
+const revisionRequest = (f, session, body) => session.fetch(f.base + PATH, {
+    method: 'POST', headers: AUTH, body: JSON.stringify({ type: 'normal', duration: 5, ...body }),
+});
+
+test('latest JSON/SSE revision survives a fresh page as one reply; every draft waits for durable save', async t => {
+    for (const stream of [false, true]) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+        page.arm(); const session = await replySession(page);
+        const ids = [];
+        for (const testReply of ['초안', '첫 수정본', '마지막 수정본 🤍']) {
+            const response = await revisionRequest(f, session, { stream, testReply, duration: stream ? 60 : 5 });
+            ids.push(response.headers.get('x-silly-relay-job'));
+            await response.text();
+        }
+        assert.equal(page.recovery.list().length, 1);
+        assert.equal(page.recovery.list()[0].jobs.length, 3);
+        for (const job of ids) assert.equal((await f.request(`/jobs/${job}`)).status, 200);
+        page.recovery.stop();
+        const fresh = await b.makePage(); b.disk.failSave = true;
+        await fresh.recovery.recover();
+        assert.equal(fresh.ctx.chat[1].mes, '마지막 수정본 🤍');
+        for (const job of ids) assert.equal((await f.request(`/jobs/${job}`)).status, 200);
+        b.disk.failSave = false; await fresh.recovery.recover();
+        assert.equal(b.disk.messages.length, 2);
+        assert.equal(b.disk.messages[1].mes, '마지막 수정본 🤍');
+        assert.equal(f.calls.length, 3, 'recovery never generates another answer');
+        assert.equal(fresh.recovery.list().length, 0);
+        for (const job of ids) assert.equal((await f.request(`/jobs/${job}`)).status, 410);
+        await (await b.makePage()).recovery.recover();
+        assert.equal(b.disk.messages.length, 2);
+    }
+});
+
+test('reload waits for submitted revision instead of showing its already completed draft', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    await (await revisionRequest(f, session, { testReply: '초안' })).text();
+    const pending = revisionRequest(f, session, { stream: true, testReply: '아직 작성 중인 수정본', duration: 200 });
+    const response = await pending;
+    page.recovery.stop();
+    const fresh = await b.makePage();
+    const recovering = fresh.recovery.recover();
+    await delay(40);
+    assert.equal(b.rendered.length, 0);
+    await recovering;
+    assert.equal(b.disk.messages[1].mes, '아직 작성 중인 수정본');
+    assert.equal(response.status, 200);
+    assert.equal(f.calls.length, 2);
+});
+
+test('failed or empty rewrite falls back to last readable candidate; selected guard fallback is respected', async t => {
+    for (const failure of ['http', 'empty', 'selected']) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+        page.arm(); const session = await replySession(page);
+        const good = await revisionRequest(f, session, { testReply: '보존할 답장' }); await good.text();
+        const bad = await revisionRequest(f, session, failure === 'http' ? { error: true }
+            : { testReply: failure === 'empty' ? '' : '검수에서 선택하지 않은 결과' }); await bad.text();
+        if (failure === 'selected') session.complete(good);
+        page.recovery.stop();
+        await (await b.makePage()).recovery.recover();
+        assert.equal(b.disk.messages[1]?.mes, '보존할 답장', failure);
+        assert.equal(f.calls.length, 2);
+    }
+});
+
+test('revision session keeps helpers out, preserves payloads and selects the guard final response', async t => {
+    const f = await fixture(t, { perUserActive: 1 }), b = await recoveryBrowser(t, f), page = await b.makePage();
+    const { createTransport } = await import('../transport.mjs');
+    const { createReplySessions } = await import('../reply-session.mjs');
+    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch,
+        shouldRelay: () => false, prepareRecovery: data => page.recovery.prepare(data),
+        onEvent: (type, data) => page.recovery.event(type, data) });
+    page.arm(); const sessions = createReplySessions({ enabled: () => true, recovery: page.recovery, transport });
+    const session = sessions.begin();
+    assert.equal(sessions.begin(), null, 'one session per native reply');
+    const helpers = Array.from({ length: 5 }, (_, i) => transport.fetch(f.base + PATH,
+        { method: 'POST', headers: AUTH, body: JSON.stringify({ testReply: `judge ${i}`, duration: 80 }) }).then(r => r.text()));
+    const draft = await revisionRequest(f, session, { testReply: 'draft' }); await draft.text();
+    const rewritten = await revisionRequest(f, session, { type: 'quiet', testReply: 'final', messages: [{ role: 'user', content: 'unchanged' }] });
+    await rewritten.text(); session.complete(rewritten); await Promise.all(helpers);
+    assert.equal(page.recovery.list().length, 1); assert.equal(page.recovery.list()[0].jobs.length, 2);
+    assert.equal(page.recovery.list()[0].jobId, rewritten.headers.get('x-silly-relay-job'));
+    page.ctx.chat.push({ name: 'Character', is_user: false, mes: 'final' });
+    page.recovery.tag(1, true); await page.ctx.saveChat(); await page.recovery.settle();
+    assert.equal(page.recovery.list().length, 0);
+    assert.equal(f.calls.length, 7);
+    assert.equal(f.calls.at(-1).body.messages[0].content, 'unchanged');
+    assert.equal(f.calls.at(-1).body.type, 'quiet');
+    await assert.rejects(() => revisionRequest(f, session, { testReply: 'too late' }));
+});
+
+test('cancelled revision sequence never restores its draft; unrelated chat edits remain protected', async t => {
+    for (const action of ['cancel', 'edit']) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+        page.arm(); const session = await replySession(page);
+        await (await revisionRequest(f, session, { testReply: 'draft' })).text();
+        await (await revisionRequest(f, session, { testReply: 'final' })).text();
+        if (action === 'cancel') session.cancel();
+        else b.disk.messages[0].mes = '사용자 수정';
+        page.recovery.stop(); await (await b.makePage()).recovery.recover();
+        assert.equal(b.disk.messages.length, 1);
+        if (action === 'edit') assert.equal(b.disk.messages[0].mes, '사용자 수정');
+    }
+});
+
+test('latest rewritten swipe keeps every prior candidate and metadata unchanged', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f); seedSwipes(b);
+    const previous = structuredClone(b.disk.messages[1]);
+    const page = await b.makePage(); armSwipe(page); const session = await replySession(page);
+    await (await revisionRequest(f, session, { type: 'swipe', testReply: 'new draft' })).text();
+    await (await revisionRequest(f, session, { type: 'quiet', testReply: 'last revised swipe' })).text();
+    page.recovery.stop(); await (await b.makePage()).recovery.recover();
+    const message = b.disk.messages[1];
+    assert.equal(message.mes, 'last revised swipe');
+    assert.equal(message.swipes.length, 3);
+    assert.deepEqual(message.swipes.slice(0, 2), previous.swipes);
+    assert.deepEqual(message.swipe_info.slice(0, 2), previous.swipe_info);
+});
+
+test('reply session preserves intervening fetch wrappers when forwarding a scoped request', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    let calls = 0;
+    const wrapper = (input, init) => { calls++; return page.transport.fetch(input, { ...init }); };
+    const response = await session.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: JSON.stringify({ type: 'quiet', testReply: 'rewritten', duration: 5 }) }, wrapper);
+    await response.text(); session.complete(response);
+    assert.equal(calls, 1);
+    assert.ok(response.headers.get('x-silly-relay-job'));
+    assert.equal(page.recovery.list().length, 1);
+    assert.equal(page.recovery.list()[0].finalized, true);
+});
+
+test('a sequence with no readable candidate releases its buffers without inventing a reply', async t => {
+    for (const error of [true, false]) {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+        page.arm(); const session = await replySession(page);
+        const response = await revisionRequest(f, session, { error, testReply: '' });
+        session.complete(response);
+        await response.text(); page.recovery.generationEnded();
+        await page.recovery.recover();
+        assert.equal(b.disk.messages.length, 1);
+        assert.equal(page.recovery.list().length, 0);
+        // Live HTTP-error receipts are sent asynchronously after the body EOF.
+        let status;
+        const deadline = Date.now() + 2000;
+        do {
+            status = (await f.request(`/jobs/${response.headers.get('x-silly-relay-job')}`)).status;
+            if (status === 410) break;
+            await delay(10);
+        } while (Date.now() < deadline);
+        assert.equal(status, 410);
+    }
+});
+
+test('nested quiet helper cannot consume the pending native reply recovery session', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm();
+    page.recovery.generationStarted('quiet'); page.recovery.dataReady({}, false);
+    assert.equal(await replySession(page), null);
+    page.recovery.generationEnded();
+    const session = await replySession(page);
+    assert.ok(session);
+    const response = await revisionRequest(f, session, { testReply: 'main survives helper' });
+    await response.text(); session.complete(response);
+    page.recovery.stop(); await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages[1].mes, 'main survives helper');
+});
