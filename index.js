@@ -1,6 +1,7 @@
-import { createTransport } from './transport.mjs?v=1.0.5';
-import { createRecovery } from './recovery.mjs?v=1.0.5';
-import { recoveryIdentity } from './identity.mjs?v=1.0.5';
+import { createTransport } from './transport.mjs?v=1.0.6';
+import { createRecovery } from './recovery.mjs?v=1.0.6';
+import { recoveryIdentity } from './identity.mjs?v=1.0.6';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.6';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -13,6 +14,8 @@ let lastEvent = '아직 생성 요청이 없습니다.';
 let lastRecoveryEvent = '';
 let checking = false;
 let recovery;
+const replies = createReplyFilter();
+const allowWarning = createWarningGate();
 const context = () => globalThis.SillyTavern?.getContext?.();
 const headers = () => context()?.getRequestHeaders?.() || { 'Content-Type': 'application/json' };
 function readStored(key, fallback) {
@@ -51,7 +54,8 @@ function onEvent(type, data) {
     lastEvent = `${names[type] || type}${data.message ? `: ${data.message}` : ''}`;
     if (type === 'accepted') lastEvent += data.reloadRecovery ? ' · 재접속 복구 준비됨' : ' · 이 요청은 새로고침 복구 대상 아님';
     update();
-    if (['error', 'cancel-pending', 'recovery-unavailable'].includes(type)) notify(lastEvent);
+    if (['error', 'cancel-pending', 'recovery-unavailable'].includes(type)
+        && allowWarning(data.httpStatus === 429 ? 'relay-capacity' : lastEvent)) notify(lastEvent);
 }
 async function flushCancellations() {
     for (const id of cancellations()) {
@@ -68,7 +72,7 @@ async function check() {
         const result = await transport.api('/status', { headers: headers() });
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `서버 ${result.version} 연결됨`;
+        state = `확장 1.0.6 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -91,6 +95,7 @@ function initialize() {
         } });
     } catch { tabId = null; recoveryStorage = { getItem: () => null, setItem: () => {} }; }
     transport = createTransport({ fetchImpl: originalFetch, origin: location.href,
+        shouldRelay: replies.take,
         enabled: () => active, onEvent, saveCancellation,
         prepareRecovery: data => tabId ? recovery.prepare(data) : Promise.resolve(false) });
     recovery = createRecovery({ getContext: context, api: transport.api, fetchImpl: originalFetch,
@@ -134,7 +139,7 @@ function initialize() {
         active = event.target.checked;
         writeStored(ENABLE_KEY, active);
         if (active) void check();
-        else { state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
+        else { replies.clear(); state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
     });
     panel.querySelector('[data-check]').addEventListener('click', check);
     panel.querySelector('[data-previous-panel]').hidden = !standalone;
@@ -161,14 +166,14 @@ function initialize() {
                 } catch { notify('복구 상태 처리에 실패했습니다. 답변 생성은 계속 진행합니다.'); }
             });
         };
-        on('GENERATION_STARTED', recovery.generationStarted);
-        on('GENERATE_AFTER_DATA', recovery.dataReady);
-        on('CHAT_COMPLETION_SETTINGS_READY', recovery.settingsReady);
-        on('GENERATION_ENDED', recovery.generationEnded);
-        on('GENERATION_STOPPED', recovery.generationStopped);
+        on('GENERATION_STARTED', (...args) => { replies.generationStarted(...args); recovery.generationStarted(...args); });
+        on('GENERATE_AFTER_DATA', (...args) => { replies.dataReady(...args); recovery.dataReady(...args); });
+        on('CHAT_COMPLETION_SETTINGS_READY', data => { if (replies.settingsReady(data)) recovery.settingsReady(data); });
+        on('GENERATION_ENDED', (...args) => { replies.generationEnded(); recovery.generationEnded(...args); });
+        on('GENERATION_STOPPED', (...args) => { replies.clear(); recovery.generationStopped(...args); });
         on('STREAM_TOKEN_RECEIVED', () => recovery.tag(null, false));
         on('MESSAGE_RECEIVED', id => recovery.tag(id, true));
-        on('CHAT_CHANGED', resume);
+        on('CHAT_CHANGED', () => { replies.clear(); resume(); });
         on('APP_READY', resume);
     }
     setInterval(() => { if (active && tabId) void recovery.recover(); }, 10000);
@@ -178,3 +183,4 @@ function initialize() {
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
 else initialize();
+

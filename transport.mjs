@@ -17,6 +17,7 @@ function decode(data) {
 }
 
 export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {},
+    shouldRelay = () => false,
     saveCancellation = () => {}, prepareRecovery = async () => false,
     requestTimeout = 30000, retryDelay = 1000, startRetryMs = 60000 }) {
     function emit(type, detail = {}) { try { onEvent(type, detail); } catch { /* UI never owns the request. */ } }
@@ -48,10 +49,15 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         let body = init?.body;
         if (body === undefined && request && !request.bodyUsed) body = await request.clone().text();
         if (typeof body !== 'string') {
-            throw new Error('Silly Relay은 JSON 생성 요청만 지원합니다. 연결 유지를 끈 뒤 다시 시도해 주세요.');
+            return fetchImpl(input, init);
         }
-        try { const parsed = JSON.parse(body); if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error(); }
-        catch { throw new Error('Silly Relay에서 생성 요청 본문을 읽지 못했습니다.'); }
+        let payload;
+        try { payload = JSON.parse(body); }
+        catch { return fetchImpl(input, init); }
+        let isReply = false;
+        try { isReply = shouldRelay({ path: url.pathname, payload }) === true; }
+        catch { /* Unknown requests retain the original transport. */ }
+        if (!isReply) return fetchImpl(input, init);
         const signal = init?.signal ?? request?.signal;
         if (signal?.aborted) throw abortError();
         const headers = new Headers(init?.headers ?? request?.headers);
@@ -183,9 +189,10 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
                 throw error;
             }
             if (!error.httpStatus && !stopped) void sendCancel();
-            cleanup(); emit('error', { id, message: error.message }); throw error;
+            cleanup(); emit('error', { id, message: error.message, httpStatus: error.httpStatus }); throw error;
         }
     }
     Object.defineProperty(wrappedFetch, '__sillyRelay', { value: true });
     return { fetch: wrappedFetch, api };
 }
+

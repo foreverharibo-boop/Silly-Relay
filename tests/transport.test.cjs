@@ -9,7 +9,7 @@ test('abort during acceptance rejects as cancellation without emitting request-e
     const began = new Promise(resolve => { started = resolve; });
     const gate = new Promise(resolve => { release = resolve; });
     const events = [], calls = [], controller = new AbortController();
-    const transport = createTransport({ origin, enabled: () => true,
+    const transport = createTransport({ shouldRelay: () => true, origin, enabled: () => true,
         onEvent: type => events.push(type),
         fetchImpl: async (url) => {
             calls.push(url);
@@ -30,7 +30,7 @@ test('server-confirmed cancellation is not a request error or a new cancel reque
     const { createTransport } = await import('../transport.mjs');
     for (const stage of ['acceptance', 'result']) {
         const events = [], calls = [];
-        const transport = createTransport({ origin, enabled: () => true,
+        const transport = createTransport({ shouldRelay: () => true, origin, enabled: () => true,
             onEvent: type => events.push(type), fetchImpl: async url => {
                 calls.push(url);
                 return json({ state: stage === 'result' && url.endsWith('/jobs') ? 'running' : 'cancelled' });
@@ -44,10 +44,11 @@ test('server-confirmed cancellation is not a request error or a new cancel reque
 test('real server failures still emit request errors', async () => {
     const { createTransport } = await import('../transport.mjs');
     const events = [];
-    const transport = createTransport({ origin, enabled: () => true,
+    const transport = createTransport({ shouldRelay: () => true, origin, enabled: () => true,
         onEvent: (type, data) => events.push({ type, data }),
         fetchImpl: async () => json({ error: 'fixture unavailable' }, 503) });
     await assert.rejects(transport.fetch(PATH, { method: 'POST', body: '{}' }), /fixture unavailable/);
     assert.equal(events.filter(e => e.type === 'error').length, 1);
     assert.equal(events.some(e => e.type === 'cancelled'), false);
 });
+

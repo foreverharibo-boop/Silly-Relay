@@ -83,11 +83,38 @@ async function fixture(t, limits = {}, network = {}) {
     return { base, request, start, get, calls };
 }
 
+test('five concurrent helpers bypass relay capacity while the main reply is relayed once', async t => {
+    const f = await fixture(t, { perUserActive: 1 });
+    const { createTransport } = await import('../transport.mjs');
+    const { createReplyFilter } = await import('../reply-filter.mjs');
+    const filter = createReplyFilter();
+    const events = [];
+    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch,
+        shouldRelay: filter.take, onEvent: type => events.push(type) });
+    filter.generationStarted();
+    const helpers = Array.from({ length: 5 }, (_, i) => {
+        const data = { messages: [{ role: 'user', content: `helper ${i}` }], duration: 100 };
+        filter.settingsReady(data);
+        return transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(data) }).then(r => r.json());
+    });
+    const prompt = [{ role: 'user', content: 'character reply' }];
+    filter.dataReady({ prompt });
+    const main = { messages: prompt.filter(Boolean), stream: true, duration: 180 };
+    filter.settingsReady(main);
+    const reply = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(main) });
+    assert.match(await reply.text(), /\[DONE\]/);
+    await Promise.all(helpers);
+    assert.equal(f.calls.length, 6, 'each AI request is sent exactly once');
+    assert.equal(events.filter(e => e === 'accepted').length, 1);
+    assert.equal(events.filter(e => e === 'completed').length, 1);
+    assert.equal(events.includes('error'), false);
+});
+
 test('wildcard IPv4 listener routes LAN and mapped Tailscale requests through authenticated loopback once', async t => {
     for (const acceptedAddress of ['192.0.2.10', '::ffff:100.85.10.10']) {
         const f = await fixture(t, {}, { listenHost: '0.0.0.0', acceptedAddress });
         const { createTransport } = await import('../transport.mjs');
-        const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+        const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, fetchImpl: fetch });
         const body = { duration: 10, messages: [{ role: 'user', content: 'preserve prompt' }] };
         const response = await transport.fetch(f.base + PATH, {
             method: 'POST', headers: { ...AUTH, host: 'untrusted.invalid:9', 'x-forwarded-for': '203.0.113.5' },
@@ -129,7 +156,7 @@ test('missing listener metadata preserves the accepted address and mapped IPv4 n
 test('loopback still applies server rejection without an alternate generation attempt', async t => {
     const f = await fixture(t, {}, { listenHost: '0.0.0.0', acceptedAddress: '100.85.10.10', rejectGeneration: true });
     const { createTransport } = await import('../transport.mjs');
-    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, fetchImpl: fetch });
     const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{}' });
     assert.equal(response.status, 403);
     assert.deepEqual(await response.json(), { error: 'internal request denied' });
@@ -245,7 +272,7 @@ test('browser fetch resumes after network failures and a lost start response, wi
     let loseStart = true;
     let failedReads = 0;
     const events = [];
-    const transport = createTransport({ origin: f.base, enabled: () => true, retryDelay: 10,
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, retryDelay: 10,
         fetchImpl: async (url, init) => {
             if (String(url).includes('?cursor=') && failedReads++ < 3) throw new TypeError('offline');
             const response = await fetch(url, init);
@@ -268,7 +295,7 @@ test('browser fetch resumes after network failures and a lost start response, wi
 test('browser stop signal cancels job; backend error status is preserved', async t => {
     const f = await fixture(t);
     const { createTransport } = await import('../transport.mjs');
-    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, fetchImpl: fetch });
     const controller = new AbortController();
     const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"stream":true,"duration":500}', signal: controller.signal });
     const reader = response.body.getReader();
@@ -285,7 +312,7 @@ test('browser stop signal cancels job; backend error status is preserved', async
 test('browser Request input and cloned streaming response stay readable', async t => {
     const f = await fixture(t);
     const { createTransport } = await import('../transport.mjs');
-    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, fetchImpl: fetch });
     const req = new Request(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"stream":true}' });
     const response = await transport.fetch(req);
     const clone = response.clone();
@@ -299,7 +326,7 @@ test('a timed-out poll reconnects without being mistaken for the user stop butto
     const f = await fixture(t, { pollMs: 20 });
     const { createTransport } = await import('../transport.mjs');
     let stalled = false;
-    const transport = createTransport({ origin: f.base, enabled: () => true, requestTimeout: 80, retryDelay: 5,
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, requestTimeout: 80, retryDelay: 5,
         fetchImpl: async (url, init) => {
             if (String(url).includes('?cursor=') && !stalled) {
                 stalled = true;
@@ -316,7 +343,7 @@ test('a timed-out poll reconnects without being mistaken for the user stop butto
 test('disabled transport passes the original request through without a relay job', async t => {
     const f = await fixture(t);
     const { createTransport } = await import('../transport.mjs');
-    const transport = createTransport({ origin: f.base, enabled: () => false, fetchImpl: fetch });
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => false, fetchImpl: fetch });
     const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{}' });
     assert.equal(response.status, 200);
     assert.ok((await response.json()).choices);
@@ -346,7 +373,7 @@ test('delivery acknowledgement immediately removes the body but preserves duplic
 test('browser automatically acknowledges a complete response without an archive or manual action', async t => {
     const f = await fixture(t);
     const { createTransport } = await import('../transport.mjs');
-    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch });
+    const transport = createTransport({ shouldRelay: () => true, origin: f.base, enabled: () => true, fetchImpl: fetch });
     const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: '{"stream":true}' });
     const jobId = response.headers.get('x-silly-relay-job');
     assert.ok((await response.text()).includes('안녕 🤍'));
@@ -375,7 +402,7 @@ async function recoveryBrowser(t, f) {
             return fetch(url, init);
         };
         let recovery;
-        const transport = createTransport({ fetchImpl: request, origin: f.base, enabled: () => true,
+        const transport = createTransport({ shouldRelay: () => true, fetchImpl: request, origin: f.base, enabled: () => true,
             prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => recovery.event(type, data) });
         recovery = createRecovery({ getContext: () => ctx, api: transport.api, fetchImpl: request,
             getHeaders: () => AUTH, storage, tabId, ...options, notify: text => messages.push(text),
@@ -386,6 +413,36 @@ async function recoveryBrowser(t, f) {
     }
     return { makePage, disk, messages, rendered, emitted, diagnostics, MARK };
 }
+
+test('filtered untyped native reply still restores after reload; helper creates no recovery record', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    const { createReplyFilter } = await import('../reply-filter.mjs');
+    const { createTransport } = await import('../transport.mjs');
+    const filter = createReplyFilter();
+    const transport = createTransport({ origin: f.base, enabled: () => true, fetchImpl: fetch,
+        shouldRelay: filter.take, prepareRecovery: data => page.recovery.prepare(data),
+        onEvent: (type, data) => page.recovery.event(type, data) });
+    page.arm(); filter.generationStarted();
+    const helper = { messages: [{ role: 'user', content: 'helper' }], duration: 5 };
+    if (filter.settingsReady(helper)) page.recovery.settingsReady(helper);
+    await (await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(helper) })).text();
+    assert.equal(page.recovery.list().length, 0);
+    const prompt = [{ role: 'user', content: 'native reply' }];
+    filter.dataReady({ prompt });
+    const main = { messages: prompt.filter(Boolean), duration: 5 };
+    if (filter.settingsReady(main)) page.recovery.settingsReady(main);
+    main.silly_pop = { generationId: 'notifier-kept' };
+    const response = await transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(main) });
+    const jobId = response.headers.get('x-silly-relay-job');
+    assert.ok(jobId);
+    await response.text(); page.recovery.stop();
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages.length, 2);
+    assert.equal(b.disk.messages[1].mes, '서버가 끝까지 받은 답장 🤍');
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.equal(f.calls.length, 2);
+    assert.deepEqual(f.calls[1].body.silly_pop, main.silly_pop);
+});
 
 test('reload before completion restores JSON and split-Unicode SSE into the original chat exactly once', async t => {
     for (const stream of [false, true]) {
@@ -692,7 +749,7 @@ test('recovery preflight failure cannot cancel or duplicate the original generat
     const { createTransport } = await import('../transport.mjs');
     for (const reason of ['server capability check failed', 'QuotaExceededError', 'chat read-back failed']) {
         const f = await fixture(t); const events = [];
-        const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+        const transport = createTransport({ shouldRelay: () => true, fetchImpl: fetch, origin: f.base, enabled: () => true,
             prepareRecovery: async () => { throw new Error(reason); },
             onEvent: (type, data) => events.push({ type, data }) });
         const body = JSON.stringify({ type: 'normal', messages: [{ role: 'user', content: '그대로 보내기' }], duration: 10 });
@@ -729,7 +786,7 @@ test('storage denial degrades recovery without preventing the reply', async t =>
     const ctx = { chat: [{ name: 'User', is_user: true, mes: 'Hi' }], characters: [{ avatar: 'Char.png' }],
         characterId: 0, chatId: 'Chat', name2: 'Character' };
     const events = []; let recovery;
-    const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+    const transport = createTransport({ shouldRelay: () => true, fetchImpl: fetch, origin: f.base, enabled: () => true,
         prepareRecovery: data => recovery.prepare(data), onEvent: (type, data) => events.push({ type, data }) });
     recovery = createRecovery({ getContext: () => ctx, api: transport.api,
         fetchImpl: () => { throw new Error('Must not read chat on generation path'); }, getHeaders: () => AUTH,
@@ -745,7 +802,7 @@ test('storage denial degrades recovery without preventing the reply', async t =>
 test('explicit abort during failed optional preparation still prevents the AI request', async t => {
     const f = await fixture(t); const { createTransport } = await import('../transport.mjs');
     const controller = new AbortController();
-    const transport = createTransport({ fetchImpl: fetch, origin: f.base, enabled: () => true,
+    const transport = createTransport({ shouldRelay: () => true, fetchImpl: fetch, origin: f.base, enabled: () => true,
         prepareRecovery: async () => { controller.abort(); throw new Error('optional failure'); } });
     await assert.rejects(transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
         body: '{"type":"normal"}', signal: controller.signal }), { name: 'AbortError' });
@@ -1075,3 +1132,4 @@ test('capacity diagnostics distinguish active generations from retained replies'
     assert.equal(f.calls.length, 1);
     assert.equal((await f.get(jobId)).state, 'completed');
 });
+
