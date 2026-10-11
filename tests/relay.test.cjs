@@ -1147,6 +1147,85 @@ async function replySession(page) {
     const { createReplySessions } = await import('../reply-session.mjs');
     return createReplySessions({ enabled: () => true, recovery: page.recovery, transport: page.transport }).begin();
 }
+
+test('recovery does not promise an earlier answer when the first request was rejected', async t => {
+    const f = await fixture(t, { perUserActive: 0 }), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    await assert.rejects(() => revisionRequest(f, session, { testReply: 'never generated' }), { httpStatus: 429 });
+    page.recovery.stop();
+    const fresh = await b.makePage(); await fresh.recovery.recover({ manual: true });
+    assert.equal(f.calls.length, 0);
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal(b.rendered.length, 0);
+    assert.ok([...b.messages, ...b.diagnostics].some(text => /429/.test(text)), 'preserve the actual rejection status');
+    assert.ok(!b.messages.some(text => /이전 답장을 확인/.test(text)), 'do not imply that a previous draft exists');
+});
+
+test('recovery checks server truth after a read error instead of discarding a completed reply', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const response = await revisionRequest(f, session, { testReply: 'server still has this answer' });
+    await response.text();
+    const jobId = response.headers.get('x-silly-relay-job');
+    page.recovery.event('error', { id: jobId, httpStatus: 503 });
+    page.recovery.stop();
+    const fresh = await b.makePage(); await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1]?.mes, 'server still has this answer');
+    assert.equal(f.calls.length, 1);
+    assert.equal(fresh.recovery.list().length, 0);
+});
+
+test('a missing latest revision does not hide the preceding retained reply', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const good = await revisionRequest(f, session, { testReply: 'retained original' });
+    await good.text();
+    const latest = await revisionRequest(f, session, { testReply: 'latest' });
+    await latest.text();
+    const missingId = latest.headers.get('x-silly-relay-job');
+    page.recovery.stop();
+    const fresh = await b.makePage('same-tab', { api: (path, init) => {
+        if (path.startsWith(`/jobs/${missingId}`)) return Promise.reject(Object.assign(new Error('missing'), { httpStatus: 404 }));
+        return page.transport.api(path, init);
+    } });
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1]?.mes, 'retained original');
+    assert.equal(f.calls.length, 2);
+    assert.equal(fresh.recovery.list().length, 0);
+});
+
+test('a decoding failure retains the response and journal until recovery can read it', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const good = await revisionRequest(f, session, { testReply: 'keep undecoded reply' }); await good.text();
+    const jobId = good.headers.get('x-silly-relay-job');
+    page.recovery.stop();
+    const broken = await b.makePage('same-tab', { parser: async () => ({ extract() { throw Error('parser unavailable'); } }) });
+    await broken.recovery.recover();
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 200, 'an unreadable response is not a saved reply receipt');
+    assert.equal(broken.recovery.list().length, 1, 'keep recovery binding for a later attempt');
+    broken.recovery.stop();
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages[1]?.mes, 'keep undecoded reply');
+    assert.equal(f.calls.length, 1);
+});
+
+test('an extractor returning empty text must not erase a nonempty retained response', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const response = await revisionRequest(f, session, { testReply: 'nonempty server answer' }); await response.text();
+    const jobId = response.headers.get('x-silly-relay-job'); page.recovery.stop();
+    const fresh = await b.makePage('same-tab', { parser: async () => ({ extract: () => '' }) });
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal(fresh.recovery.list().length, 1);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 200);
+    fresh.recovery.stop();
+    await (await b.makePage()).recovery.recover();
+    assert.equal(b.disk.messages[1]?.mes, 'nonempty server answer');
+    assert.equal(f.calls.length, 1);
+});
 const revisionRequest = (f, session, body) => session.fetch(f.base + PATH, {
     method: 'POST', headers: AUTH, body: JSON.stringify({ type: 'normal', duration: 5, ...body }),
 });

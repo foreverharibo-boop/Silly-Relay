@@ -51,11 +51,23 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
     // Recovery must not turn reasoning on. Older journals have no request flag;
     // those follow the current setting, while an explicit request opt-out stays off.
     const includeReasoning = showThoughts === true && record.includeReasoning !== false;
-    let text = '', reasoning = '';
+    let text = '', reasoning = '', recognizedReply = false, rawReplyPresent = false;
     const streamState = { reasoning: '', images: [], signature: '', toolSignatures: {} };
     function validate(data) {
-        if (data.error || data.type === 'error') throw new Error('AI 오류 응답은 채팅에 복구하지 않습니다.');
+        if (data.error || data.type === 'error') throw Object.assign(
+            new Error('AI 오류 응답은 채팅에 복구하지 않습니다.'), { candidateRejected: true });
         const choices = data.choices || [];
+        const fields = [
+            ...choices.flatMap(c => [c.message?.content, c.delta?.content, c.text]),
+            data.output, data.content, data.text, data.token, data.results?.[0]?.text, data.delta?.text,
+        ];
+        for (const value of fields) {
+            const known = typeof value === 'string' || value === null
+                || Array.isArray(value) && value.every(p => p && ['text', 'thinking'].includes(p.type));
+            if (!known) continue;
+            recognizedReply = true;
+            rawReplyPresent ||= !!textContent(value).trim();
+        }
         if (choices.some(c => c.delta?.tool_calls?.length || c.message?.tool_calls?.length || c.delta?.function_call || c.message?.function_call)
             || data.content_block?.type === 'tool_use' || data.content?.some?.(p => p.type === 'tool_use')
             || data.candidates?.some(c => c.content?.parts?.some(p => p.functionCall))) {
@@ -91,7 +103,9 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
         if (includeReasoning) reasoning = data.choices?.[0]?.message?.reasoning_content ?? data.choices?.[0]?.message?.reasoning
             ?? data.content?.filter?.(p => p.type === 'thinking').map(p => p.thinking || '').join('') ?? '';
     }
-    if (typeof text !== 'string' || !text.trim()) throw new Error('복구할 텍스트 답장을 찾지 못했습니다.');
+    if (typeof text !== 'string' || !text.trim()) throw Object.assign(
+        new Error('복구할 텍스트 답장을 찾지 못했습니다.'),
+        { candidateRejected: recognizedReply && !rawReplyPresent && typeof text === 'string' && !text.trim() });
     return { text, reasoning, signature: streamState.signature || null };
 }
 
@@ -441,9 +455,11 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 change(record.id, null); live.delete(record.id); return;
             }
             const jobs = record.jobs.map(job => job.id === data.id
-                ? { ...job, ...(type === 'completed' ? { bytes: data.bytes, status: data.status } : {}),
+                ? { ...job, ...(type === 'completed' ? { bytes: data.bytes, status: data.status, failed: false } : {}),
                     ...(['cancelled', 'cancel-pending'].includes(type) || type === 'error' && data.httpStatus
-                        ? { failed: true } : {}) } : job);
+                        ? { failed: true } : {}),
+                    ...(type === 'error' && Number.isInteger(data.httpStatus)
+                        ? { failureHttpStatus: data.httpStatus } : {}) } : job);
             change(record.id, { ...record, jobs });
             // A failed revision must not erase its previous good draft.
             // The explicit session completes/cancels the logical reply.
@@ -525,34 +541,70 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const candidates = record.jobs
             ? (record.selectedId ? record.jobs.filter(job => job.id === record.selectedId) : [...record.jobs].reverse())
             : [record];
-        let lastError;
+        const failures = [];
+        let missingError, undecoded = false;
+        const failedDetail = (job, detail) => {
+            const previousStatus = job.status >= 400 ? job.status : job.failureHttpStatus;
+            failures.push(`${sourceId(job).slice(0, 8)}: ${detail}${previousStatus >= 400 && previousStatus <= 599
+                ? ` · 기록된 오류 HTTP ${previousStatus}` : ''}`);
+        };
         for (const job of candidates) {
-            if (job.failed || job.status && (job.status < 200 || job.status >= 300)) {
-                lastError = new Error('재작성 요청이 완료되지 않아 이전 답장을 확인합니다.');
-                continue;
-            }
+            // A browser-side read/acceptance error does not prove that the
+            // server failed to finish. Check each retained job before discarding
+            // it, including journals written by older extension versions.
             const candidate = record.jobs ? { ...record, ...job, id: record.id, jobId: job.id } : record;
             let data;
             try { data = await readReply(candidate); }
             catch (error) {
+                if (record.jobs && [404, 410].includes(error.httpStatus)) {
+                    missingError ||= error;
+                    failedDetail(job, `응답을 찾지 못함 (HTTP ${error.httpStatus})`);
+                    continue;
+                }
                 // Network uncertainty is never evidence to fall back to a draft.
                 if (!error.candidateFailed) throw error;
-                lastError = error; continue;
+                failedDetail(job, '완료된 정상 답장 없음');
+                continue;
             }
             if (!data) return null;
             let reply;
             try { reply = decodeReply(data.raw, data.record, decoding); }
-            catch (error) { lastError = error; continue; }
+            catch (error) {
+                if (error.candidateRejected) {
+                    // A fully read, recognized empty/provider-error response
+                    // has no character text to save. Unknown formats and parser
+                    // failures below must keep their bytes for a later attempt.
+                    try {
+                        await api(`/jobs/${sourceId(data.record)}/ack`, { method: 'POST', headers: getHeaders(),
+                            body: JSON.stringify({ cursor: data.record.bytes }) });
+                    } catch (ackError) {
+                        if (![404, 410].includes(ackError.httpStatus)) throw ackError;
+                    }
+                    failedDetail(job, '빈 본문 또는 AI 오류 응답');
+                    continue;
+                }
+                undecoded = true;
+                failedDetail(job, '응답은 있으나 답장 본문을 읽지 못함');
+                continue;
+            }
             if (record.jobs) {
                 data.record = { ...data.record, selectedId: job.id, finalized: true, reviewing: false };
                 change(record.id, data.record);
             }
             return { ...data, reply };
         }
-        if (record.jobs && await release(record)) {
-            change(record.id, null); live.delete(record.id);
+        const details = failures.slice(0, 4).join('; ');
+        const message = undecoded
+            ? `서버 응답은 있지만 답장 본문을 읽지 못해 복구하지 못했어요. 남은 응답은 삭제하지 않았어요. (${details})`
+            : `확인한 ${candidates.length}개 요청에서 복구할 완료 답장을 찾지 못했어요.${details ? ` (${details})` : ''}`;
+        if (missingError && !undecoded) {
+            // Let the normal saved-reply checks run before retiring the journal.
+            missingError.recoveryDetail = message;
+            throw missingError;
         }
-        throw lastError || new Error('복구할 완료 답장이 없습니다.');
+        // Decoding failure is NOT a durable chat receipt. Never ACK/delete an
+        // unreadable response merely because every candidate failed to decode.
+        throw Object.assign(new Error(message), { noCompletedReply: candidates.length > 0 && !undecoded });
     }
     async function apply(record, reply, finishedAt) {
         let ctx = getContext();
@@ -644,15 +696,17 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         if (await acknowledge(record)) continue;
                         if (position(record, await diskChat(record))?.done) continue;
                         change(record.id, null);
-                        const message = error.httpStatus === 410
+                        const message = error.recoveryDetail || (error.httpStatus === 410
                             ? `이전 복구 요청 ${record.id.slice(0, 8)}: 서버는 전달 완료로 표시하지만 채팅 저장을 확인하지 못했어요 (HTTP 410). 현재 새 답장의 생성 결과와는 별개예요.`
-                            : `이전 복구 요청 ${record.id.slice(0, 8)}: 서버에 응답이 남아 있지 않아 복구할 수 없어요 (HTTP 404). 현재 새 답장의 생성 결과와는 별개이며, 사라진 원인은 확인되지 않았어요.`;
+                            : `이전 복구 요청 ${record.id.slice(0, 8)}: 서버에 응답이 남아 있지 않아 복구할 수 없어요 (HTTP 404). 현재 새 답장의 생성 결과와는 별개이며, 사라진 원인은 확인되지 않았어요.`);
                         // Startup/chat-open checks are not new generation errors.
                         // Keep the diagnosis visible in settings; a user-requested
                         // recovery still receives direct feedback.
                         diagnostic(message);
                         if (manual) warn(record, message);
                     } else if (!(error instanceof TypeError || ['TimeoutError', 'AbortError'].includes(error.name))) {
+                        if (error.noCompletedReply) { change(record.id, null); live.delete(record.id); }
+                        diagnostic(error.message);
                         warn(record, error.message);
                     }
                 }
