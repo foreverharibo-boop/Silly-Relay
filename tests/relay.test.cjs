@@ -1707,3 +1707,157 @@ test('a newer final selection during reply formatting supersedes an accepted can
     assert.equal(b.disk.messages[1].extra[b.MARK].reviewIncomplete, undefined);
     assert.equal(f.calls.length, 2);
 });
+
+test('matching completion markers with different bodies preserve both versions and retain recovery', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage(); old.arm();
+    const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: JSON.stringify({type:'normal',duration:5,testReply:'Long answer with missing section'}) });
+    await response.text(); const jobId=response.headers.get('x-silly-relay-job');
+    old.ctx.chat.push({name:'Character',is_user:false,mes:'Short answer',swipes:['Short answer'],swipe_id:0,extra:{}});
+    old.recovery.tag(1,true); await old.ctx.saveChat(); old.recovery.stop();
+    const fresh=await b.makePage();
+    b.disk.messages[1].mes='Long answer with missing section';
+    b.disk.messages[1].swipes[0]=b.disk.messages[1].mes;
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat[1].mes,'Short answer');
+    assert.equal(b.disk.messages[1].mes,'Long answer with missing section');
+    assert.equal(fresh.recovery.list().length,1);
+    assert.equal(b.rendered.length,0);
+    assert.ok(b.messages.some(text=>text.includes('현재 화면의 내용이 달라')));
+    assert.equal((await f.request(`/jobs/${jobId}`)).status,200);
+    const reloaded=await b.makePage();
+    assert.equal(reloaded.ctx.chat[1].mes,'Long answer with missing section');
+});
+
+test('receive-hook body change updates both the rendered reply and its saved swipe', async t => {
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,
+        body:JSON.stringify({type:'normal',duration:5,testReply:'Visible first section'})});
+    await response.text();old.recovery.stop();
+    const fresh=await b.makePage();let screen='',renders=0;
+    fresh.ctx.addOneMessage=message=>{screen=message.mes;renders++;};
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){
+            fresh.ctx.chat[index].mes='Visible first section plus previously unseen section';
+            fresh.ctx.chat[index].swipes[0]=fresh.ctx.chat[index].mes;
+        }
+    };
+    await fresh.recovery.recover();
+    assert.equal(screen,'Visible first section plus previously unseen section');
+    assert.equal(renders,2);
+    assert.equal(b.disk.messages[1].mes,'Visible first section plus previously unseen section');
+    assert.equal(fresh.recovery.list().length,0);
+    assert.equal((await b.makePage()).ctx.chat[1].mes,b.disk.messages[1].mes);
+});
+
+test('another page save during formatting stops stale recovery before rendering or saving', async t => {
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,
+        body:JSON.stringify({type:'normal',duration:5,testReply:'Recovery candidate'})});
+    await response.text();old.recovery.stop();
+    let finish,entered;
+    const started=new Promise(resolve=>{entered=resolve;});
+    const fresh=await b.makePage('same-tab',{formatReply:text=>{entered();return new Promise(resolve=>{finish=()=>resolve(text);});}});
+    const pending=fresh.recovery.recover();await started;
+    b.disk.messages.push({name:'Character',is_user:false,mes:'Newer answer saved by another page',extra:{},swipe_id:0,swipes:['Newer answer saved by another page']});
+    finish();await pending;
+    assert.equal(b.disk.messages[1].mes,'Newer answer saved by another page');
+    assert.equal(fresh.ctx.chat.length,1);
+    assert.equal(b.rendered.length,0);
+    assert.equal(fresh.recovery.list().length,1);
+});
+
+for (const throwAfterChange of [false, true]) test(`postprocessing redraw respects translated display text, even on failure=${throwAfterChange}`, async t => {
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,body:'{"type":"normal","duration":5}'});
+    await response.text();old.recovery.stop();
+    const fresh=await b.makePage();let screen='',updates=0;
+    fresh.ctx.addOneMessage=message=>{screen=message.extra?.display_text??message.mes;};
+    fresh.ctx.updateMessageBlock=(index,message)=>{assert.equal(index,1);screen=message.extra?.display_text??message.mes;updates++;};
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){
+            fresh.ctx.chat[index].mes='Final original';
+            fresh.ctx.chat[index].extra.display_text='최종 번역';
+            if(throwAfterChange)throw Error('postprocessor failed after changing text');
+        }
+    };
+    await fresh.recovery.recover();
+    assert.equal(screen,'최종 번역');assert.equal(updates,1);
+    assert.equal(b.disk.messages[1].mes,'Final original');
+    assert.equal(b.disk.messages[1].swipes[0],'Final original');
+    assert.equal(b.disk.messages[1].swipe_info[0].extra.display_text,'최종 번역');
+    assert.equal(fresh.recovery.list().length,0);
+});
+
+test('periodic settlement cannot release a reply while its receive hook is still running',async t=>{
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,body:'{"type":"normal","duration":5}'});
+    await response.text();old.recovery.stop();const jobId=response.headers.get('x-silly-relay-job');
+    const fresh=await b.makePage();let entered,finish;
+    const ready=new Promise(resolve=>{entered=resolve;});
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){entered();await new Promise(resolve=>{finish=resolve;});fresh.ctx.chat[index].mes='After slow review';}
+    };
+    const pending=fresh.recovery.recover();await ready;
+    await fresh.recovery.settle();
+    assert.equal(fresh.recovery.list().length,1);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status,200);
+    finish();await pending;
+    assert.equal(b.disk.messages[1].mes,'After slow review');
+    assert.equal(fresh.recovery.list().length,0);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status,410);
+});
+
+test('a remote save during postprocessing is preserved instead of overwritten by the final local save',async t=>{
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,body:'{"type":"normal","duration":5}'});
+    await response.text();old.recovery.stop();const fresh=await b.makePage();
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){
+            fresh.ctx.chat[index].mes='Local processed reply';
+            b.disk.messages[index].mes='Other device edited reply';
+            b.disk.messages[index].swipes[0]='Other device edited reply';
+        }
+    };
+    await fresh.recovery.recover();await fresh.recovery.settle();
+    assert.equal(b.disk.messages[1].mes,'Other device edited reply');
+    assert.equal(fresh.ctx.chat[1].mes,'Local processed reply');
+    assert.equal(fresh.recovery.list().length,1);
+    assert.ok(b.messages.some(message=>message.includes('서버의 채팅 내용이 바뀌어')));
+});
+
+test('a receive hook may save its own final body before relay saves later metadata',async t=>{
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,body:'{"type":"normal","duration":5}'});
+    await response.text();old.recovery.stop();const fresh=await b.makePage();
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){
+            const message=fresh.ctx.chat[index];message.mes='Self-saved final';message.swipes[0]=message.mes;
+            await fresh.ctx.saveChat();message.extra.sceneFacts={location:'Room'};
+        }
+    };
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1].mes,'Self-saved final');
+    assert.equal(b.disk.messages[1].extra.sceneFacts.location,'Room');
+    assert.equal(fresh.recovery.list().length,0);
+});
+
+for(const change of ['chat','swipe','message'])test(`late postprocessing cannot redraw or save after ${change} replacement`,async t=>{
+    const f=await fixture(t),b=await recoveryBrowser(t,f),old=await b.makePage();old.arm();
+    const response=await old.transport.fetch(f.base+PATH,{method:'POST',headers:AUTH,body:'{"type":"normal","duration":5}'});
+    await response.text();old.recovery.stop();const fresh=await b.makePage();let saves=0,redraws=0;
+    const save=fresh.ctx.saveChat;fresh.ctx.saveChat=async()=>{saves++;await save();};
+    fresh.ctx.updateMessageBlock=()=>{redraws++;};
+    fresh.ctx.eventSource.emit=async(type,index)=>{
+        if(type==='received'){
+            fresh.ctx.chat[index].mes='Changed by hook';
+            if(change==='chat'){fresh.ctx.chatId='Other';fresh.ctx.chat=[{is_user:true,mes:'Other chat'}];}
+            if(change==='swipe'){fresh.ctx.chat[index].swipe_id=1;fresh.ctx.chat[index].swipes.push('Other swipe');fresh.ctx.chat[index].mes='Other swipe';}
+            if(change==='message')fresh.ctx.chat[index]={name:'Character',mes:'Replacement message',extra:{}};
+        }
+    };
+    await fresh.recovery.recover();
+    assert.equal(saves,1);assert.equal(redraws,0);
+    assert.equal(b.disk.messages[1].mes,'서버가 끝까지 받은 답장 🤍');
+    assert.equal(fresh.recovery.list().length,1);
+});

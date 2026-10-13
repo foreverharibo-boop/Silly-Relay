@@ -120,6 +120,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     const warned = new Set();
     const pendingReviews = new Map();
     const receipts = new Map();
+    const processing = new Set();
     const sequences = new WeakSet();
     // Volatile capabilities, not journal data. After a page reload the old
     // 429die timers are gone too; never attach an old recovery to a new request.
@@ -243,7 +244,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const ctx = getContext();
         if (stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
         const target = position(record, ctx.chat);
-        if (target?.done) { reportVisibleReply(record); return true; }
+        if (target?.done) {
+            if (!sameCompletedReply(record, ctx.chat, saved)) {
+                warn(record, '저장 완료 표시는 있지만 현재 화면의 내용이 달라 복구 확인을 보류했어요. 수동 수정이 사라지지 않도록 덮어쓰지 않았어요. 내용을 확인한 뒤 원래 채팅을 다시 열어 주세요.');
+                return false;
+            }
+            reportVisibleReply(record); return true;
+        }
         if (generating) return false;
         // A previous page may have saved just after this page loaded the chat.
         // Display that exact durable message, without saving stale history back
@@ -263,6 +270,28 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         notify('채팅 파일에 저장된 답장을 화면에 불러왔어요.', true);
         return true;
     }
+    function completedReply(record, chat) {
+        const found = completedPosition(record, chat);
+        if (!found || found.index !== record.count
+            || fingerprint(chat.slice(0, record.count)) !== record.anchor) return null;
+        const message = chat[found.index];
+        const matches = mark => mark?.id === record.id && mark.complete
+            && (!record.revision || mark.revision === record.revision);
+        const selected = message.swipe_id ?? 0;
+        const slot = message.swipe_info?.findIndex(info => matches(info?.extra?.[MARK])) ?? -1;
+        const swipe = slot >= 0 ? slot : matches(message.extra?.[MARK]) ? selected : -1;
+        if (swipe < 0 || isSwipe(record) && swipe !== record.swipeCount) return null;
+        const text = swipe === selected ? message.mes : message.swipes?.[swipe];
+        if (typeof text !== 'string') return null;
+        if (typeof message.swipes?.[swipe] === 'string' && message.swipes[swipe] !== text) return null;
+        const extra = swipe === selected ? message.extra : message.swipe_info?.[swipe]?.extra;
+        return JSON.stringify([found.index, swipe, message.name, !!message.is_user, !!message.is_system,
+            text, message.swipes?.[swipe] ?? text, extra?.display_text ?? null]);
+    }
+    function sameCompletedReply(record, left, right) {
+        const a = completedReply(record, left), b = completedReply(record, right);
+        return a !== null && a === b;
+    }
     async function release(record) {
         // The logical reply owns every draft buffer. Release them only after
         // the selected reply has a durable chat receipt, never after a draft.
@@ -281,7 +310,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return true;
     }
     async function receipt(record) {
-        if (needsReview(record)) return false;
+        if (needsReview(record) || processing.has(record.id)) return false;
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
@@ -289,7 +318,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // flight. An old draft receipt must not release its newer revision.
         const current = allRecords().find(r => r.id === record.id);
         if (!current || current.revision !== record.revision || current.jobId !== record.jobId
-            || needsReview(current)) return false;
+            || needsReview(current) || processing.has(record.id)) return false;
         if (!completedPosition(record, saved)) return false;
         if (!showSaved(record, saved)) return false;
         if (record.jobs && !record.finalized && live.has(record.id)) return false;
@@ -627,6 +656,20 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // unreadable response merely because every candidate failed to decode.
         throw Object.assign(new Error(message), { noCompletedReply: candidates.length > 0 && !undecoded });
     }
+    async function saveCurrent(record, baseline, stillCurrent) {
+        const latest = await diskChat(record);
+        if (!stillCurrent()) return false;
+        const ctx = getContext();
+        // A receive hook may already have saved our final body. Otherwise only
+        // write over the disk state we actually observed, never a different reply.
+        if (fingerprint(latest) !== fingerprint(baseline)
+            && fingerprint(latest) !== fingerprint(ctx.chat)) {
+            throw new Error('복구 도중 서버의 채팅 내용이 바뀌어 저장을 멈췄어요. 다른 기기의 답장을 덮어쓰지 않았어요. 원래 채팅을 다시 열어 확인해 주세요.');
+        }
+        // This is a browser-side recheck, not an atomic server-wide save lock.
+        await ctx.saveChat();
+        return stillCurrent();
+    }
     async function apply(record, reply, finishedAt) {
         let ctx = getContext();
         if (generating || needsReview(record) || record.jobs && !unchanged(record)
@@ -638,9 +681,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (position(record, saved)?.done) { await acknowledge(record); return true; }
         const text = await formatReply(reply.text);
         if (!text.trim()) throw new Error('답장 정리 후 복구할 본문이 없습니다.');
+        const latestSaved = await diskChat(record);
         ctx = getContext();
         if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
             || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        if (fingerprint(latestSaved) !== fingerprint(saved)) {
+            if (position(record, latestSaved)?.done) { await acknowledge(record); return false; }
+            throw new Error('복구 준비 중 서버의 채팅 내용이 바뀌어 자동 복구를 멈췄어요. 원래 채팅을 다시 열어 확인해 주세요.');
+        }
         if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
             // Already durable AND visible. Release only this response, with no
             // chat write, replayed hooks or misleading recovery success toast.
@@ -653,58 +701,93 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!position(record, saved)) throw new Error('서버의 채팅 내용이 바뀌어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
         const target = position(record, ctx.chat);
         if (!target) throw new Error('채팅에 새 메시지나 수정이 있어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
-        if (!target.done) {
-            const message = { name: record.name, is_user: false, is_system: false,
-                send_date: new Date(finishedAt || Date.now()).toISOString(), mes: text,
-                gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
-                extra: { api: 'openai', model: record.model,
-                    reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
-                    reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
-                        ...(record.reviewIncomplete ? { reviewIncomplete: true } : {}),
-                        ...(record.revision ? { revision: record.revision } : {}) } },
-                swipe_id: 0, swipes: [text] };
-            message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
-                gen_finished: message.gen_finished, extra: JSON.parse(JSON.stringify(message.extra)) }];
-            if (isSwipe(record)) {
-                const previous = ctx.chat[target.index];
-                const previousInfo = previous.swipe_info || [{ send_date: previous.send_date,
-                    gen_started: previous.gen_started, gen_finished: previous.gen_finished,
-                    extra: JSON.parse(JSON.stringify(previous.extra || {})) }];
-                // Keep every original candidate and its metadata byte-for-byte.
-                // Replace only this request's partial slot, or append one new slot.
-                const info = message.swipe_info[0];
-                const extra = message.extra;
-                Object.assign(message, { ...previous, ...message,
-                    swipes: [...variants(previous).slice(0, record.swipeCount), message.mes],
-                    swipe_id: record.swipeCount,
-                    swipe_info: [...previousInfo.slice(0, record.swipeCount), info], extra });
+        const chat = ctx.chat;
+        let currentMessage = chat[target.index];
+        let currentSwipe = currentMessage?.swipe_id ?? 0;
+        const expectedLength = target.index === chat.length ? chat.length + 1 : chat.length;
+        const stillCurrent = () => !generating && !stopped && isVisible()
+            && sameChat(chatIdentity(getContext()), record.identity) && getContext().chat === chat
+            && chat.length === expectedLength && chat[target.index] === currentMessage
+            && (currentMessage?.swipe_id ?? 0) === currentSwipe;
+        const displayState = () => JSON.stringify([currentMessage?.mes, currentMessage?.extra?.display_text,
+            currentMessage?.extra?.reasoning, currentMessage?.extra?.reasoning_signature]);
+        const redraw = () => {
+            if (!stillCurrent()) return;
+            const context = getContext();
+            if (typeof context.updateMessageBlock === 'function') context.updateMessageBlock(target.index, currentMessage);
+            else context.addOneMessage(currentMessage, { type: 'swipe' });
+        };
+        processing.add(record.id);
+        try {
+            if (!target.done) {
+                const message = { name: record.name, is_user: false, is_system: false,
+                    send_date: new Date(finishedAt || Date.now()).toISOString(), mes: text,
+                    gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
+                    extra: { api: 'openai', model: record.model,
+                        reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
+                        reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
+                            ...(record.reviewIncomplete ? { reviewIncomplete: true } : {}),
+                            ...(record.revision ? { revision: record.revision } : {}) } },
+                    swipe_id: 0, swipes: [text] };
+                message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
+                    gen_finished: message.gen_finished, extra: JSON.parse(JSON.stringify(message.extra)) }];
+                if (isSwipe(record)) {
+                    const previous = ctx.chat[target.index];
+                    const previousInfo = previous.swipe_info || [{ send_date: previous.send_date,
+                        gen_started: previous.gen_started, gen_finished: previous.gen_finished,
+                        extra: JSON.parse(JSON.stringify(previous.extra || {})) }];
+                    // Keep every original candidate and its metadata byte-for-byte.
+                    // Replace only this request's partial slot, or append one new slot.
+                    const info = message.swipe_info[0];
+                    const extra = message.extra;
+                    Object.assign(message, { ...previous, ...message,
+                        swipes: [...variants(previous).slice(0, record.swipeCount), message.mes],
+                        swipe_id: record.swipeCount,
+                        swipe_info: [...previousInfo.slice(0, record.swipeCount), info], extra });
+                }
+                const replacing = target.index < ctx.chat.length;
+                ctx.chat[target.index] = message;
+                currentMessage = message;
+                currentSwipe = message.swipe_id ?? 0;
+                ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
+                // The complete reply is now visible. Cancel only its bound main
+                // retry before slow saves. Do not replay translation/review hooks;
+                // normal MESSAGE_RECEIVED remains after the durable-save check.
+                reportVisibleReply(record);
+                // Save a durable deduplication marker before other extensions can pause or throw.
+                if (!await saveCurrent(record, saved, stillCurrent)) return false;
+                const durable = await diskChat(record);
+                if (!stillCurrent()) return false;
+                if (!sameCompletedReply(record, chat, durable)) throw new Error('복구한 답장의 저장 내용이 화면과 일치하는지 확인하지 못했어요. 응답을 유지하고 다시 확인합니다.');
+                if (stillCurrent()) {
+                    let displayed = displayState();
+                    const syncDisplay = () => {
+                        if (!stillCurrent()) return;
+                        // Native saveReply syncs the selected swipe after receive
+                        // hooks. Do the same without touching other candidates.
+                        if (Array.isArray(currentMessage.swipes)) currentMessage.swipes[currentSwipe] = currentMessage.mes;
+                        if (currentMessage.swipe_info?.[currentSwipe]) {
+                            currentMessage.swipe_info[currentSwipe].extra = structuredClone(currentMessage.extra ?? {});
+                        }
+                        if (displayState() !== displayed) { redraw(); displayed = displayState(); }
+                    };
+                    try {
+                        const type = isSwipe(record) ? 'swipe' : 'normal';
+                        await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, target.index, type);
+                        syncDisplay();
+                        if (stillCurrent()) {
+                            await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, target.index, type);
+                        }
+                    } catch { warn(record, '답장은 복구했지만 후처리 확장에서 오류가 났습니다.'); }
+                    finally { syncDisplay(); }
+                    if (!stillCurrent() || !await saveCurrent(record, durable, stillCurrent)) return false;
+                }
+            } else {
+                // A previous save failed but the in-memory restored message is still present.
+                reportVisibleReply(record);
+                if (!await saveCurrent(record, saved, stillCurrent)) return false;
             }
-            const replacing = target.index < ctx.chat.length;
-            ctx.chat[target.index] = message;
-            ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
-            // The complete reply is now visible. Cancel only its bound main
-            // retry before slow saves. Do not replay translation/review hooks;
-            // normal MESSAGE_RECEIVED remains after the durable-save check.
-            reportVisibleReply(record);
-            // Save a durable deduplication marker before other extensions can pause or throw.
-            await ctx.saveChat();
-            const durable = await diskChat(record);
-            if (!position(record, durable)?.done) throw new Error('복구한 답장의 저장을 확인하지 못했습니다. 응답을 유지하고 다시 시도합니다.');
-            if (sameChat(chatIdentity(getContext()), record.identity)) {
-                try {
-                    const type = isSwipe(record) ? 'swipe' : 'normal';
-                    await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, target.index, type);
-                    if (sameChat(chatIdentity(getContext()), record.identity)) {
-                        await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, target.index, type);
-                        await getContext().saveChat();
-                    }
-                } catch { warn(record, '답장은 복구했지만 후처리 확장에서 오류가 났습니다.'); }
-            }
-        } else {
-            // A previous save failed but the in-memory restored message is still present.
-            reportVisibleReply(record);
-            await ctx.saveChat();
-        }
+        } finally { processing.delete(record.id); }
         if (await acknowledge(record)) notify(record.reviewIncomplete
             ? '검수 미완료 답장을 직접 복구했어요. 검수를 통과한 답장이라는 뜻은 아니에요.'
             : '다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
