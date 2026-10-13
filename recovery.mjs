@@ -111,13 +111,16 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
 
 export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage, tabId,
     formatReply = async text => text, parser = async () => ({}), notify = () => {}, diagnostic = () => {},
-    isVisible = () => true, allowPreviousSession = false }) {
+    isVisible = () => true, allowPreviousSession = false, captureReplyReceipt = () => null }) {
     let owner = null, ticket = null, generating = false, busy = false;
     const generationParents = [];
     const live = new Set();
     const warned = new Set();
     const receipts = new Map();
     const sequences = new WeakSet();
+    // Volatile capabilities, not journal data. After a page reload the old
+    // 429die timers are gone too; never attach an old recovery to a new request.
+    const replyReceipts = new Map();
     const sources = record => record.jobs || [record];
     const sourceId = record => record.jobId || record.id;
     let stopped = false;
@@ -140,6 +143,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // Do not silently evict an unresolved reply.
         if (all.length > 64) throw new Error('복구 대기 요청이 너무 많습니다. 기존 요청을 먼저 확인해 주세요.');
         storage.setItem(storageKey(), JSON.stringify(all));
+        if (!value) replyReceipts.delete(id);
+    }
+    function reportVisibleReply(record) {
+        if (record.reviewing && !record.finalized || record.jobs && !record.finalized) return;
+        const receipt = replyReceipts.get(record.id);
+        replyReceipts.delete(record.id);
+        try { receipt?.received?.(); } catch { /* Retry integration cannot interrupt recovery/save. */ }
     }
     function warn(record, message) {
         const key = `${record?.id || ''}:${message}`;
@@ -229,7 +239,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const ctx = getContext();
         if (stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
         const target = position(record, ctx.chat);
-        if (target?.done) return true;
+        if (target?.done) { reportVisibleReply(record); return true; }
         if (generating) return false;
         // A previous page may have saved just after this page loaded the chat.
         // Display that exact durable message, without saving stale history back
@@ -245,6 +255,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const replacing = target.index < ctx.chat.length;
         ctx.chat[target.index] = message;
         ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
+        reportVisibleReply(record);
         notify('채팅 파일에 저장된 답장을 화면에 불러왔어요.', true);
         return true;
     }
@@ -401,6 +412,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!sequence && data.type === undefined && (!pending.request || requestFingerprint(pending.request) !== requestFingerprint(data))) return false;
         const currentTicket = pending;
         if (!sequence) ticket = null;
+        let replyReceipt = null;
+        // Bind only a new root reply, before identify() or any other await can
+        // yield to another generation. Revisions keep their root's receipt.
+        if (!root) {
+            try { replyReceipt = captureReplyReceipt(currentTicket.identity); }
+            catch { /* 429die is optional. */ }
+        }
         await identify();
         const ctx = getContext();
         const identity = chatIdentity(ctx);
@@ -441,6 +459,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             throw error;
         }
         live.add(record.id);
+        if (!root && typeof replyReceipt?.received === 'function') replyReceipts.set(record.id, replyReceipt);
         if (sequence) { sequence.id = record.id; sequence.latestId = id; }
         return true;
     }
@@ -620,6 +639,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
             // Already durable AND visible. Release only this response, with no
             // chat write, replayed hooks or misleading recovery success toast.
+            reportVisibleReply(record);
             if (!await release(record)) return false;
             change(record.id, null);
             live.delete(record.id);
@@ -656,6 +676,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             const replacing = target.index < ctx.chat.length;
             ctx.chat[target.index] = message;
             ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
+            // The complete reply is now visible. Cancel only its bound main
+            // retry before slow saves. Do not replay translation/review hooks;
+            // normal MESSAGE_RECEIVED remains after the durable-save check.
+            reportVisibleReply(record);
             // Save a durable deduplication marker before other extensions can pause or throw.
             await ctx.saveChat();
             const durable = await diskChat(record);
@@ -672,6 +696,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             }
         } else {
             // A previous save failed but the in-memory restored message is still present.
+            reportVisibleReply(record);
             await ctx.saveChat();
         }
         if (await acknowledge(record)) notify('다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
@@ -788,4 +813,3 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     function stop() { stopped = true; }
     return { beginSequence, beginReview, acceptReview, completeReview, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }
-
