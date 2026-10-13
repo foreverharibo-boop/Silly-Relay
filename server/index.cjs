@@ -4,7 +4,9 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const VERSION = '1.0.2';
+const { createJournal } = require('./diagnostics.cjs');
+const path = require('node:path');
+const VERSION = '1.0.3';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -40,9 +42,11 @@ function ownerOf(req) {
     return owner;
 }
 
-// Temporary transport buffers only. No archive, result history or disk storage.
+// Reply bodies remain temporary memory buffers. Only sanitized diagnostics persist.
 function createRelay(overrides = {}) {
     const limits = { ...DEFAULT_LIMITS, ...overrides };
+    const journal = overrides.journal;
+    const trace = (owner, stage, id, data) => { try { journal?.record(owner, stage, id, data); } catch { /* Logging never controls delivery. */ } };
     const jobs = new Map();
     let totalBytes = 0;
     const keyOf = (owner, id) => JSON.stringify([owner, id]);
@@ -58,7 +62,9 @@ function createRelay(overrides = {}) {
     function prune() {
         const now = Date.now();
         for (const job of jobs.values()) {
-            if (job.state !== 'running' && now - job.finishedAt > limits.retentionMs) remove(job);
+            if (job.state !== 'running' && now - job.finishedAt > limits.retentionMs) {
+                trace(job.owner, 'expired', job.id, { bytes: job.size }); remove(job);
+            }
         }
     }
     function finish(job, state, error = '') {
@@ -70,6 +76,7 @@ function createRelay(overrides = {}) {
         job.upstream = null;
         if (state === 'failed' || state === 'cancelled') release(job);
         job.events.emit('change');
+        trace(job.owner, state, job.id, { status: job.status, bytes: job.size });
         // Metadata only. Never log the body, character names, cookies or keys.
         console.log(`[Silly Relay] ${job.id.slice(0, 8)} ${state} (HTTP ${job.status || 'pending'}, ${job.size} bytes)`);
     }
@@ -120,6 +127,7 @@ function createRelay(overrides = {}) {
         const existing = jobs.get(keyOf(owner, id));
         if (existing) {
             if (existing.digest && existing.digest !== digest) throw fail(409, '같은 작업 번호에 다른 요청이 들어왔습니다.');
+            trace(owner, 'duplicate_start', id, { bytes: existing.size, status: existing.status });
             return existing; // A lost start response must not cause a second AI request.
         }
         // Use the actual accepted server socket, never a URL or port supplied by a client.
@@ -144,6 +152,7 @@ function createRelay(overrides = {}) {
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
             events: new EventEmitter(), upstream: null, timer: null };
         jobs.set(keyOf(owner, id), job);
+        trace(owner, 'accepted', id);
         const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
             'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
         // Authenticate the internal HTTP request through ST's own middleware again.
@@ -154,6 +163,7 @@ function createRelay(overrides = {}) {
         const upstream = http.request({ hostname: address, port: req.socket.localPort,
             path, method: 'POST', headers, agent: false }, response => {
             job.status = response.statusCode || 502;
+            trace(owner, 'upstream_headers', id, { status: job.status });
             job.contentType = String(response.headers['content-type'] || 'application/octet-stream');
             job.events.emit('change');
             const encoding = response.headers['content-encoding'];
@@ -190,14 +200,20 @@ function createRelay(overrides = {}) {
         return job;
     }
     function install(router) {
-        const wrap = handler => (req, res) => {
+        const wrap = handler => async (req, res) => {
             res.setHeader('Cache-Control', 'no-store');
-            try { return handler(req, res); }
-            catch (error) { return res.status(error.status || 500).json({ error: error.status ? error.message : '서버 처리 오류입니다.' }); }
+            try { return await handler(req, res); }
+            catch (error) {
+                trace(req.user?.profile?.handle, 'api_error', req.params?.id || req.body?.id, { status: error.status || 500 });
+                return res.status(error.status || 500).json({ error: error.status ? error.message : '서버 처리 오류입니다.' }); }
         };
         router.get('/status', wrap((req, res) => {
             const owner = ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, owner });
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, diagnosticJournal: !!journal, owner });
+        }));
+        router.get('/diagnostics', wrap(async (req, res) => {
+            const owner = ownerOf(req);
+            res.json(journal ? await journal.report(owner) : { unavailable: true, events: [] });
         }));
         router.post('/jobs', wrap((req, res) => res.status(202).json(describe(start(req)))));
         router.get('/jobs/:id', wrap((req, res) => {
@@ -205,17 +221,25 @@ function createRelay(overrides = {}) {
             if (job.state === 'delivered') throw fail(410, '전달이 끝난 응답은 즉시 삭제됩니다.');
             const cursor = Number(req.query.cursor || 0);
             if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > job.size) throw fail(400, '잘못된 응답 위치입니다.');
-            const send = () => { cleanup(); if (!res.destroyed && !res.writableEnded) res.json(snapshot(job, cursor)); };
+            const send = () => {
+                cleanup();
+                if (!res.destroyed && !res.writableEnded) {
+                    const data = snapshot(job, cursor);
+                    trace(job.owner, 'read', job.id, { cursor, next: data.next, bytes: job.size, status: job.status });
+                    res.json(data);
+                }
+            };
+            const disconnected = () => { trace(job.owner, 'reader_disconnected', job.id, { cursor }); cleanup(); };
             const cleanup = () => {
                 clearTimeout(timer);
                 job.events.removeListener('change', send);
-                res.removeListener('close', cleanup);
+                res.removeListener('close', disconnected);
             };
             let timer;
             if (job.size > cursor || job.state !== 'running' || req.query.wait !== '1') return send();
             timer = setTimeout(send, limits.pollMs);
             job.events.on('change', send);
-            res.once('close', cleanup); // Disconnect only removes this reader, never the job.
+            res.once('close', disconnected); // Disconnect only removes this reader, never the job.
         }));
         router.post('/jobs/:id/cancel', wrap((req, res) => {
             const owner = ownerOf(req);
@@ -245,6 +269,7 @@ function createRelay(overrides = {}) {
             release(job);
             // Keep just identity/status/digest to reject duplicate, billable starts.
             job.state = 'delivered';
+            trace(job.owner, 'acknowledged', job.id, { bytes: job.size });
             res.json({ ok: true });
         }));
     }
@@ -253,15 +278,16 @@ function createRelay(overrides = {}) {
     function close() {
         clearInterval(sweep);
         for (const job of jobs.values()) { cancel(job); remove(job); }
+        return journal?.flush();
     }
     return { install, close };
 }
 let relay;
 const info = { id: 'silly-relay', name: 'Silly Relay', description: 'Experimental server-owned, resumable AI requests' };
 async function init(router) {
-    relay = createRelay();
+    relay = createRelay({ journal: createJournal({ directory: path.join(__dirname, '..', 'diagnostic-data') }) });
     relay.install(router);
     console.log(`[Silly Relay] ${VERSION} loaded`);
 }
-async function exit() { relay?.close(); }
+async function exit() { await relay?.close(); }
 module.exports = { info, init, exit, createRelay, internalAddress };

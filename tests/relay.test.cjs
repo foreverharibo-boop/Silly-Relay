@@ -4,6 +4,10 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { randomBytes } = require('node:crypto');
 const { createRelay } = require('../server/index.cjs');
+const { createJournal } = require('../server/diagnostics.cjs');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const pathModule = require('node:path');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const id = () => randomBytes(16).toString('hex');
 const PATH = '/api/backends/chat-completions/generate';
@@ -1910,4 +1914,25 @@ test('metadata already updated before recovery is not replaced by stale page his
     assert.equal(b.disk.messages[0].extra.display_text, 'new translation already saved');
     assert.equal(fresh.ctx.chat.length, 1); assert.equal(b.rendered.length, 0);
     assert.equal(fresh.recovery.list().length, 1);
+});
+
+test('authenticated export connects server lifecycle events and cannot request another account history', async t => {
+    const directory = await fs.mkdtemp(pathModule.join(os.tmpdir(), 'relay-api-diag-'));
+    const journal = createJournal({ directory });
+    t.after(async () => { await journal.flush(); await fs.rm(directory, { recursive: true, force: true }); });
+    const f = await fixture(t, { journal });
+    const jobId = id();
+    await f.start(jobId, { duration: 15, testReply: 'PRIVATE_REPLY', secret: 'PRIVATE_KEY' });
+    let state;
+    for (let tries = 0; tries < 50; tries++) { state = await f.get(jobId); if (state.state === 'completed') break; await delay(5); }
+    assert.equal(state.state, 'completed');
+    await f.request(`/jobs/${jobId}/ack`, { method: 'POST', body: JSON.stringify({ cursor: state.bytes }) });
+    const report = await (await f.request('/diagnostics')).json();
+    for (const stage of ['accepted', 'upstream_headers', 'completed', 'read', 'acknowledged']) {
+        assert.ok(report.events.some(e => e.id === jobId && e.stage === stage), stage);
+    }
+    assert.doesNotMatch(JSON.stringify(report), /PRIVATE_|alice/);
+    const other = await (await f.request('/diagnostics?owner=alice', { headers: { cookie: 'user=bob' } })).json();
+    assert.equal(other.events.length, 0);
+    assert.equal((await f.request('/diagnostics', { headers: { cookie: '' } })).status, 401);
 });

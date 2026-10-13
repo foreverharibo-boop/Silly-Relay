@@ -116,3 +116,20 @@ test('changed chat content prevents recovery and receipt notification', async t 
     await h.prepare(); h.ctx.chat[0].mes = 'edited history';
     await h.recovery.recover(); assert.equal(received, 0); assert.equal(h.ctx.chat.length, 1);
 });
+
+test('recovery traces link selection, display, save read-back and release without bodies', async t => {
+    const traces = [];
+    const h = fixture(t, { trace: (stage, data) => traces.push({ stage, ...data }) });
+    await h.prepare(); await h.recovery.recover({ manual: true });
+    for (const stage of ['prepared', 'candidate_read', 'candidate_selected', 'display_applied', 'save_started', 'save_returned', 'durable_verified', 'released']) {
+        assert.ok(traces.some(e => e.stage === stage && e.id === ID), stage);
+    }
+    assert.ok(traces.findIndex(e => e.stage === 'display_applied') < traces.findIndex(e => e.stage === 'durable_verified'));
+    assert.doesNotMatch(JSON.stringify(traces), /The complete reply|Chat A|Char.png/);
+});
+
+test('failing diagnostic observer cannot interrupt reply recovery', async t => {
+    const h = fixture(t, { trace() { throw Error('diagnostic failure'); }, onIdentity() { throw Error('diagnostic failure'); } });
+    await h.prepare(); await h.recovery.recover({ manual: true });
+    assert.equal(h.ctx.chat[1].mes, TEXT);
+});

@@ -1,8 +1,10 @@
-import { createTransport } from './transport.mjs?v=1.0.13';
-import { createRecovery } from './recovery.mjs?v=1.0.13';
-import { recoveryIdentity } from './identity.mjs?v=1.0.13';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.13';
-import { createReplySessions } from './reply-session.mjs?v=1.0.13';
+import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.14';
+import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.14';
+import { createTransport } from './transport.mjs?v=1.0.14';
+import { createRecovery } from './recovery.mjs?v=1.0.14';
+import { recoveryIdentity } from './identity.mjs?v=1.0.14';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.14';
+import { createReplySessions } from './reply-session.mjs?v=1.0.14';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -15,6 +17,7 @@ let lastEvent = '아직 생성 요청이 없습니다.';
 let lastRecoveryEvent = '';
 let checking = false;
 let recovery;
+let diagnostics;
 const replies = createReplyFilter();
 const allowWarning = createWarningGate();
 const context = () => globalThis.SillyTavern?.getContext?.();
@@ -46,6 +49,7 @@ function notify(message) {
     else console.warn('[Silly Relay]', message);
 }
 function onEvent(type, data) {
+    diagnostics?.record(type, data);
     try { recovery?.event(type, data); } catch { /* Recovery cannot cancel the live request. */ }
     const names = { starting: '서버로 요청 전달 중', accepted: '서버에서 생성 중 · 화면을 나가도 수신 계속',
         reconnecting: '연결 재시도 중 · 서버 작업은 유지됩니다',
@@ -71,9 +75,10 @@ async function check() {
     checking = true;
     try {
         const result = await transport.api('/status', { headers: headers() });
+        diagnostics?.bind(result.owner);
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.13 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.14 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -85,6 +90,7 @@ function initialize() {
     if (globalThis.fetch.__sillyRelay) return;
     active = readStored(ENABLE_KEY, false) === true;
     const originalFetch = globalThis.fetch.bind(globalThis);
+    diagnostics = createDiagnostics({ storage: { getItem: key => localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) } });
     let tabId;
     let recoveryStorage;
     const standalone = navigator.standalone === true || globalThis.matchMedia?.('(display-mode: standalone)').matches === true;
@@ -101,6 +107,8 @@ function initialize() {
         prepareRecovery: data => tabId ? recovery.prepare(data) : Promise.resolve(false) });
     recovery = createRecovery({ getContext: context, api: transport.api, fetchImpl: originalFetch,
         getHeaders: headers, storage: recoveryStorage, tabId,
+        trace: (stage, detail) => diagnostics.record(stage, detail),
+        onIdentity: owner => diagnostics.bind(owner),
         captureReplyReceipt: identity => {
             const bridge = globalThis.die429MainReply;
             return bridge?.apiVersion === 1 ? bridge.capture(identity) : null;
@@ -137,6 +145,8 @@ function initialize() {
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
             <p data-status></p><small data-last></small>
             <p data-recovery hidden></p>
+            <div class="sr-actions"><button class="menu_button" data-diagnostics>서버·복구 진단 내려받기</button></div>
+            <small>본문·API 키 없이 처리 기록을 자동 보관합니다. 서버 기록은 서버 재시작 후에도 남으며 오래된 기록부터 교체합니다. 서버 플러그인 1.0.3 이상이 필요합니다.</small>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
             <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>답장 복구 확인</button></div>
             <div class="sr-actions"><button class="menu_button" data-unreviewed>검수 미완료 답장 직접 복구</button></div>
@@ -153,6 +163,18 @@ function initialize() {
         else { replies.clear(); state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
     });
     panel.querySelector('[data-check]').addEventListener('click', check);
+    panel.querySelector('[data-diagnostics]').addEventListener('click', async event => {
+        const button = event.currentTarget; button.disabled = true;
+        try {
+            const report = await collectDiagnostics({ api: transport.api, headers, diagnostics, reasons: RECOVERY_REASONS });
+            const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+            const link = document.createElement('a'); link.href = url; link.download = 'silly-relay-diagnostics.json';
+            document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+            if (report.server.unavailable) notify('브라우저 기록을 내려받았어요. 서버 기록은 포함되지 않았습니다. 서버 플러그인 업데이트와 연결 상태를 확인해 주세요.');
+        } catch { notify('진단 파일을 만들지 못했어요. 브라우저 다운로드 권한을 확인해 주세요.'); }
+        finally { button.disabled = false; }
+    });
+    document.addEventListener('visibilitychange', () => diagnostics.record(document.hidden ? 'page_hidden' : 'page_visible'));
     panel.querySelector('[data-unreviewed]').addEventListener('click', async event => {
         if (!active) { notify('연결 유지를 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
         const button = event.currentTarget;
