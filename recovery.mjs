@@ -3,6 +3,7 @@ export const MARK = 'silly_relay';
 const VALID_ID = /^[a-f0-9]{32}$/;
 const KEY = 'silly-relay-recovery-v1';
 const MAX_AGE = 2 * 60 * 60 * 1000;
+const needsReview = record => !!(record.jobs || record.reviewing) && !record.finalized;
 
 // Change detection, not authentication. Two independent 32-bit lanes work on HTTP
 // origins / older Safari too (crypto.subtle is restricted to secure contexts).
@@ -111,11 +112,13 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
 
 export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage, tabId,
     formatReply = async text => text, parser = async () => ({}), notify = () => {}, diagnostic = () => {},
-    isVisible = () => true, allowPreviousSession = false, captureReplyReceipt = () => null }) {
+    isVisible = () => true, allowPreviousSession = false, captureReplyReceipt = () => null,
+    confirmUnreviewed = async () => false }) {
     let owner = null, ticket = null, generating = false, busy = false;
     const generationParents = [];
     const live = new Set();
     const warned = new Set();
+    const pendingReviews = new Map();
     const receipts = new Map();
     const sequences = new WeakSet();
     // Volatile capabilities, not journal data. After a page reload the old
@@ -134,6 +137,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         } catch { return []; }
     }
     function list() { return allRecords().filter(r => r.tab === tabId); }
+    const unchanged = record => JSON.stringify(allRecords().find(r => r.id === record.id)) === JSON.stringify(record);
     function change(id, value) {
         let all;
         try { all = JSON.parse(storage.getItem(storageKey()) || '[]'); } catch { all = []; }
@@ -143,7 +147,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // Do not silently evict an unresolved reply.
         if (all.length > 64) throw new Error('복구 대기 요청이 너무 많습니다. 기존 요청을 먼저 확인해 주세요.');
         storage.setItem(storageKey(), JSON.stringify(all));
-        if (!value) replyReceipts.delete(id);
+        if (!value) { replyReceipts.delete(id); pendingReviews.delete(id); }
     }
     function reportVisibleReply(record) {
         if (record.reviewing && !record.finalized || record.jobs && !record.finalized) return;
@@ -277,7 +281,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return true;
     }
     async function receipt(record) {
-        if (record.reviewing && !record.finalized) return false;
+        if (needsReview(record)) return false;
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
@@ -285,7 +289,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // flight. An old draft receipt must not release its newer revision.
         const current = allRecords().find(r => r.id === record.id);
         if (!current || current.revision !== record.revision || current.jobId !== record.jobId
-            || current.reviewing && !current.finalized) return false;
+            || needsReview(current)) return false;
         if (!completedPosition(record, saved)) return false;
         if (!showSaved(record, saved)) return false;
         if (record.jobs && !record.finalized && live.has(record.id)) return false;
@@ -387,9 +391,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!record) return;
         const selected = record.jobs.find(job => job.id === selectedId);
         if (selected) change(record.id, { ...record, ...selected, id: record.id,
-            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false });
-        // No selected response means an interrupted review. Keep the journal;
-        // recovery can select the newest complete, readable candidate.
+            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false, reviewIncomplete: false });
+        // No selected response means an interrupted review. Keep candidates
+        // for explicit recovery, without treating body completion as approval.
         else live.delete(record.id);
     }
     function cancelSequence(sequence) {
@@ -606,10 +610,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 failedDetail(job, '응답은 있으나 답장 본문을 읽지 못함');
                 continue;
             }
-            if (record.jobs) {
-                data.record = { ...data.record, selectedId: job.id, finalized: true, reviewing: false };
-                change(record.id, data.record);
-            }
+            // Reading a candidate is not a final-selection decision. The caller
+            // must preserve the guard's choice or get explicit user acceptance.
             return { ...data, reply };
         }
         const details = failures.slice(0, 4).join('; ');
@@ -627,15 +629,18 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     async function apply(record, reply, finishedAt) {
         let ctx = getContext();
-        if (generating || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        if (generating || needsReview(record) || record.jobs && !unchanged(record)
+            || !sameChat(chatIdentity(ctx), record.identity)) return false;
         const saved = await diskChat(record);
         // A new generation/chat switch can happen while the disk read is pending.
-        if (generating || stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
+        if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
+            || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         if (position(record, saved)?.done) { await acknowledge(record); return true; }
         const text = await formatReply(reply.text);
         if (!text.trim()) throw new Error('답장 정리 후 복구할 본문이 없습니다.');
         ctx = getContext();
-        if (generating || stopped || !isVisible() || !sameChat(chatIdentity(ctx), record.identity)) return false;
+        if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
+            || !sameChat(chatIdentity(ctx), record.identity)) return false;
         if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
             // Already durable AND visible. Release only this response, with no
             // chat write, replayed hooks or misleading recovery success toast.
@@ -655,6 +660,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 extra: { api: 'openai', model: record.model,
                     reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
                     reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
+                        ...(record.reviewIncomplete ? { reviewIncomplete: true } : {}),
                         ...(record.revision ? { revision: record.revision } : {}) } },
                 swipe_id: 0, swipes: [text] };
             message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started,
@@ -699,22 +705,46 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             reportVisibleReply(record);
             await ctx.saveChat();
         }
-        if (await acknowledge(record)) notify('다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
+        if (await acknowledge(record)) notify(record.reviewIncomplete
+            ? '검수 미완료 답장을 직접 복구했어요. 검수를 통과한 답장이라는 뜻은 아니에요.'
+            : '다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
         return true;
     }
-    async function recover({ manual = false } = {}) {
-        if (busy || generating || stopped || !isVisible()) return;
+    async function recover({ manual = false, allowUnreviewed = false } = {}) {
+        if (busy || generating || stopped || !isVisible()) {
+            if (manual) notify('답장 생성이나 복구가 끝난 뒤 원래 채팅에서 다시 눌러 주세요.');
+            return;
+        }
         busy = true;
         try {
             await identify();
             await settle();
+            let foundPending = false;
             for (const record of list()) {
                 if (live.has(record.id) || !sameChat(chatIdentity(getContext()), record.identity)) continue;
+                foundPending ||= needsReview(record);
+                if (needsReview(record) && !allowUnreviewed && pendingReviews.get(record.id) === JSON.stringify(record)) continue;
+                let expected = record;
                 try {
                     const data = await readLatest(record);
                     if (!data) continue;
+                    if (record.jobs && !unchanged(record)) continue;
+                    if (needsReview(record)) {
+                        const message = '검수 미완료 답장이 남아 있어 자동 복구를 보류했어요. 설정의 「검수 미완료 답장 직접 복구」에서 확인할 수 있어요. 서버의 임시 보관 기간 안에 확인해 주세요.';
+                        pendingReviews.set(record.id, JSON.stringify(record));
+                        if (!manual || !allowUnreviewed) { diagnostic(message); warn(record, message); continue; }
+                        if (!await confirmUnreviewed()) continue;
+                        // A delayed dialog must not accept another chat, a new
+                        // generation, or a record finalized by another page.
+                        if (generating || stopped || !isVisible() || !unchanged(record)
+                            || !sameChat(chatIdentity(getContext()), record.identity)) continue;
+                        data.record = { ...data.record, selectedId: sourceId(data.record),
+                            finalized: true, reviewing: false, reviewIncomplete: true };
+                    }
+                    if (record.jobs) { change(record.id, data.record); expected = data.record; }
                     await apply(data.record, data.reply, data.finishedAt);
                 } catch (error) {
+                    if (record.jobs && !unchanged(expected)) continue;
                     if ([404, 410].includes(error.httpStatus)) {
                         // Another page/receipt may have ACKed while this read was
                         // in flight. A saved reply is not a missing reply.
@@ -736,6 +766,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                     }
                 }
             }
+            if (manual && allowUnreviewed && !foundPending) notify('현재 채팅에 직접 복구할 검수 미완료 답장이 없어요.');
         } catch (error) { warn(null, error.message); }
         finally { busy = false; }
     }

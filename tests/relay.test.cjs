@@ -1167,6 +1167,7 @@ test('recovery checks server truth after a read error instead of discarding a co
     const response = await revisionRequest(f, session, { testReply: 'server still has this answer' });
     await response.text();
     const jobId = response.headers.get('x-silly-relay-job');
+    session.complete(response);
     page.recovery.event('error', { id: jobId, httpStatus: 503 });
     page.recovery.stop();
     const fresh = await b.makePage(); await fresh.recovery.recover();
@@ -1184,11 +1185,14 @@ test('a missing latest revision does not hide the preceding retained reply', asy
     await latest.text();
     const missingId = latest.headers.get('x-silly-relay-job');
     page.recovery.stop();
-    const fresh = await b.makePage('same-tab', { api: (path, init) => {
+    const fresh = await b.makePage('same-tab', { confirmUnreviewed: async () => true, api: (path, init) => {
         if (path.startsWith(`/jobs/${missingId}`)) return Promise.reject(Object.assign(new Error('missing'), { httpStatus: 404 }));
         return page.transport.api(path, init);
     } });
     await fresh.recovery.recover();
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal(fresh.recovery.list()[0].finalized, false);
+    await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
     assert.equal(b.disk.messages[1]?.mes, 'retained original');
     assert.equal(f.calls.length, 2);
     assert.equal(fresh.recovery.list().length, 0);
@@ -1199,6 +1203,7 @@ test('a decoding failure retains the response and journal until recovery can rea
     page.arm(); const session = await replySession(page);
     const good = await revisionRequest(f, session, { testReply: 'keep undecoded reply' }); await good.text();
     const jobId = good.headers.get('x-silly-relay-job');
+    session.complete(good);
     page.recovery.stop();
     const broken = await b.makePage('same-tab', { parser: async () => ({ extract() { throw Error('parser unavailable'); } }) });
     await broken.recovery.recover();
@@ -1215,7 +1220,7 @@ test('an extractor returning empty text must not erase a nonempty retained respo
     const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
     page.arm(); const session = await replySession(page);
     const response = await revisionRequest(f, session, { testReply: 'nonempty server answer' }); await response.text();
-    const jobId = response.headers.get('x-silly-relay-job'); page.recovery.stop();
+    const jobId = response.headers.get('x-silly-relay-job'); session.complete(response); page.recovery.stop();
     const fresh = await b.makePage('same-tab', { parser: async () => ({ extract: () => '' }) });
     await fresh.recovery.recover();
     assert.equal(b.disk.messages.length, 1);
@@ -1230,18 +1235,20 @@ const revisionRequest = (f, session, body) => session.fetch(f.base + PATH, {
     method: 'POST', headers: AUTH, body: JSON.stringify({ type: 'normal', duration: 5, ...body }),
 });
 
-test('latest JSON/SSE revision survives a fresh page as one reply; every draft waits for durable save', async t => {
+test('selected JSON/SSE revision survives a fresh page as one reply; every draft waits for durable save', async t => {
     for (const stream of [false, true]) {
         const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
         page.arm(); const session = await replySession(page);
-        const ids = [];
+        const ids = []; let selected;
         for (const testReply of ['초안', '첫 수정본', '마지막 수정본 🤍']) {
             const response = await revisionRequest(f, session, { stream, testReply, duration: stream ? 60 : 5 });
+            selected = response;
             ids.push(response.headers.get('x-silly-relay-job'));
             await response.text();
         }
         assert.equal(page.recovery.list().length, 1);
         assert.equal(page.recovery.list()[0].jobs.length, 3);
+        session.complete(selected);
         for (const job of ids) assert.equal((await f.request(`/jobs/${job}`)).status, 200);
         page.recovery.stop();
         const fresh = await b.makePage(); b.disk.failSave = true;
@@ -1259,7 +1266,7 @@ test('latest JSON/SSE revision survives a fresh page as one reply; every draft w
     }
 });
 
-test('reload waits for submitted revision instead of showing its already completed draft', async t => {
+test('reload waits for submitted revision and holds it for explicit acceptance', async t => {
     const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
     page.arm(); const session = await replySession(page);
     await (await revisionRequest(f, session, { testReply: '초안' })).text();
@@ -1271,12 +1278,15 @@ test('reload waits for submitted revision instead of showing its already complet
     await delay(40);
     assert.equal(b.rendered.length, 0);
     await recovering;
+    assert.equal(b.disk.messages.length, 1);
+    const manual = await b.makePage('same-tab', { confirmUnreviewed: async () => true });
+    await manual.recovery.recover({ manual: true, allowUnreviewed: true });
     assert.equal(b.disk.messages[1].mes, '아직 작성 중인 수정본');
     assert.equal(response.status, 200);
     assert.equal(f.calls.length, 2);
 });
 
-test('failed or empty rewrite falls back to last readable candidate; selected guard fallback is respected', async t => {
+test('unselected fallback requires acceptance; explicitly selected guard fallback is automatic', async t => {
     for (const failure of ['http', 'empty', 'selected']) {
         const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
         page.arm(); const session = await replySession(page);
@@ -1285,7 +1295,12 @@ test('failed or empty rewrite falls back to last readable candidate; selected gu
             : { testReply: failure === 'empty' ? '' : '검수에서 선택하지 않은 결과' }); await bad.text();
         if (failure === 'selected') session.complete(good);
         page.recovery.stop();
-        await (await b.makePage()).recovery.recover();
+        const fresh = await b.makePage('same-tab', { confirmUnreviewed: async () => true });
+        await fresh.recovery.recover();
+        if (failure !== 'selected') {
+            assert.equal(b.disk.messages.length, 1, failure);
+            await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+        }
         assert.equal(b.disk.messages[1]?.mes, '보존할 답장', failure);
         assert.equal(f.calls.length, 2);
     }
@@ -1336,7 +1351,8 @@ test('latest rewritten swipe keeps every prior candidate and metadata unchanged'
     const previous = structuredClone(b.disk.messages[1]);
     const page = await b.makePage(); armSwipe(page); const session = await replySession(page);
     await (await revisionRequest(f, session, { type: 'swipe', testReply: 'new draft' })).text();
-    await (await revisionRequest(f, session, { type: 'quiet', testReply: 'last revised swipe' })).text();
+    const final = await revisionRequest(f, session, { type: 'quiet', testReply: 'last revised swipe' });
+    await final.text(); session.complete(final);
     page.recovery.stop(); await (await b.makePage()).recovery.recover();
     const message = b.disk.messages[1];
     assert.equal(message.mes, 'last revised swipe');
@@ -1470,6 +1486,7 @@ for (const ttotto of [false, true]) for (const stream of [false, true]) for (con
         assert.equal(h.page.recovery.list()[0].jobs.length, ttotto ? 3 : 2);
         await h.page.recovery.settle();
         for (const job of h.page.recovery.list()[0].jobs) assert.equal((await h.f.request(`/jobs/${job.id}`)).status, 200);
+        h.publish(final);
         h.page.recovery.stop();
         const fresh = await h.b.makePage(); await fresh.recovery.recover();
         assert.equal(h.b.disk.messages.length, 2);
@@ -1538,7 +1555,7 @@ test('100LOG stop cancels active rewrite and prevents late recovery; manual edit
     const edited = await reviewedReply(t, { saveDraft: true });
     await edited.review.capture('correction', () => edited.quiet('correction', 'must not overwrite edit'));
     edited.b.disk.messages[1].mes = 'manual edit'; edited.page.recovery.stop();
-    await (await edited.b.makePage()).recovery.recover();
+    await (await edited.b.makePage('same-tab', { confirmUnreviewed: async () => true })).recovery.recover({ manual: true, allowUnreviewed: true });
     assert.equal(edited.b.disk.messages[1].mes, 'manual edit');
 });
 
@@ -1551,10 +1568,142 @@ test('100LOG cannot adopt an unrelated message or a message with no pending rela
 test('100LOG swipe adoption works before the native receive hook tags or saves the new slot', async t => {
     for (const ttotto of [false, true]) {
         const h = await reviewedReply(t, { mode: 'swipe', ttotto, saveDraft: false, unfilledSwipe: true });
-        await h.review.capture('correction', () => h.quiet('correction', 'unsaved revised swipe'));
+        const final = await h.review.capture('correction', () => h.quiet('correction', 'unsaved revised swipe'));
+        h.publish(final);
         h.page.recovery.stop(); await (await h.b.makePage()).recovery.recover();
         assert.equal(h.b.disk.messages[1].mes, 'unsaved revised swipe');
         assert.equal(h.b.disk.messages[1].swipes.length, 3);
         assert.deepEqual(h.b.disk.messages[1].swipes.slice(0,2), ['이전 후보 하나','이전 후보 둘']);
     }
+});
+
+test('unfinished review stays off screen and survives declined confirmation until explicit acceptance', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const draft = await revisionRequest(f, session, { testReply: 'unreviewed candidate' }); await draft.text();
+    const jobId = draft.headers.get('x-silly-relay-job');
+    page.recovery.stop();
+    let confirmed = false, prompts = 0, reads = 0;
+    const fresh = await b.makePage('same-tab', {
+        confirmUnreviewed: async () => { prompts++; return confirmed; },
+        api: (path, init) => { if (path.startsWith('/jobs/')) reads++; return page.transport.api(path, init); },
+    });
+    await fresh.recovery.recover();
+    const initialReads = reads;
+    await fresh.recovery.recover();
+    await fresh.recovery.recover({ manual: true }); // Ordinary recovery check is not consent.
+    assert.equal(reads, initialReads, 'do not reread the same held candidate every poll');
+    assert.equal(prompts, 0); assert.equal(b.disk.messages.length, 1);
+    assert.equal(b.rendered.length, 0); assert.equal(b.emitted.length, 0);
+    assert.equal(fresh.recovery.list()[0].finalized, false);
+    assert.equal(fresh.recovery.list()[0].selectedId, null);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 200);
+    assert.ok(b.messages.some(text => /검수 미완료/.test(text)));
+    await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+    assert.equal(prompts, 1); assert.equal(b.disk.messages.length, 1);
+    assert.equal(fresh.recovery.list()[0].finalized, false);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 200);
+    confirmed = true;
+    await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+    assert.equal(b.disk.messages[1].mes, 'unreviewed candidate');
+    assert.equal(b.disk.messages[1].extra[b.MARK].reviewIncomplete, true);
+    assert.equal(f.calls.length, 1, 'manual recovery never invokes the model');
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status, 410);
+    assert.ok(b.messages.some(text => /검수 미완료 답장을 직접 복구/.test(text)));
+});
+
+test('unfinished 100LOG review never replaces an already displayed draft automatically', async t => {
+    const h = await reviewedReply(t, { ttotto: true, saveDraft: true });
+    await h.review.capture('correction', () => h.quiet('correction', 'unselected correction'));
+    h.page.recovery.stop();
+    const before = structuredClone(h.b.disk.messages), fresh = await h.b.makePage();
+    await fresh.recovery.recover(); await fresh.recovery.settle();
+    assert.deepEqual(h.b.disk.messages, before);
+    assert.deepEqual(fresh.ctx.chat, before);
+    assert.equal(h.b.rendered.length, 0); assert.equal(h.b.emitted.length, 0);
+    assert.equal(fresh.recovery.list()[0].finalized, false);
+    for (const job of fresh.recovery.list()[0].jobs) assert.equal((await h.f.request(`/jobs/${job.id}`)).status, 200);
+});
+
+test('100LOG review without a rewrite still waits for a final decision after reload', async t => {
+    const h = await reviewedReply(t, { saveDraft: true });
+    h.page.recovery.stop();
+    const fresh = await h.b.makePage();
+    assert.ok(h.page.recovery.list()[0].selectedId, 'base selection does not prove the new review completed');
+    await fresh.recovery.recover();
+    assert.equal(fresh.recovery.list().length, 1);
+    assert.equal(fresh.recovery.list()[0].finalized, false);
+    assert.equal(h.b.rendered.length, 0);
+});
+
+for (const action of ['chat-change', 'new-generation', 'final-selection']) {
+    test(`confirmation cannot commit after ${action}`, async t => {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+        page.arm(); const session = await replySession(page);
+        const draft = await revisionRequest(f, session, { testReply: 'draft' }); await draft.text();
+        page.recovery.stop();
+        let finish, entered;
+        const ready = new Promise(resolve => { entered = resolve; });
+        const fresh = await b.makePage('same-tab', { confirmUnreviewed: () => {
+            entered(); return new Promise(resolve => { finish = resolve; });
+        } });
+        const pending = fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+        await ready;
+        if (action === 'chat-change') fresh.ctx.chatId = 'Other';
+        if (action === 'new-generation') fresh.arm();
+        if (action === 'final-selection') session.complete(draft);
+        finish(true); await pending;
+        assert.equal(b.disk.messages.length, 1); assert.equal(b.rendered.length, 0);
+        assert.equal(fresh.recovery.list()[0].reviewIncomplete, action === 'final-selection' ? false : undefined);
+        assert.equal(fresh.recovery.list()[0].finalized, action === 'final-selection');
+    });
+}
+
+test('chosen final missing from server never falls back to an unselected draft', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const draft = await revisionRequest(f, session, { testReply: 'must not show' }); await draft.text();
+    const final = await revisionRequest(f, session, { testReply: 'selected final' }); await final.text(); session.complete(final);
+    page.recovery.stop();
+    const finalId = final.headers.get('x-silly-relay-job');
+    const fresh = await b.makePage('same-tab', { api: (path, init) => path.startsWith(`/jobs/${finalId}`)
+        ? Promise.reject(Object.assign(Error('missing'), { httpStatus: 404 })) : page.transport.api(path, init) });
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages.length, 1); assert.equal(b.rendered.length, 0);
+});
+
+test('manual candidate acceptance survives a failed save without duplicate confirmation or message', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const draft = await revisionRequest(f, session, { testReply: 'accepted candidate' }); await draft.text();
+    page.recovery.stop(); let prompts = 0;
+    const fresh = await b.makePage('same-tab', { confirmUnreviewed: async () => { prompts++; return true; } });
+    b.disk.failSave = true;
+    await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+    assert.equal(fresh.ctx.chat[1].mes, 'accepted candidate'); assert.equal(b.disk.messages.length, 1);
+    assert.equal((await f.request(`/jobs/${draft.headers.get('x-silly-relay-job')}`)).status, 200);
+    b.disk.failSave = false; await fresh.recovery.recover(); await fresh.recovery.recover();
+    assert.equal(b.disk.messages.length, 2); assert.equal(prompts, 1);
+    assert.equal(b.disk.messages[1].extra[b.MARK].reviewIncomplete, true);
+    assert.equal(f.calls.length, 1);
+});
+
+test('a newer final selection during reply formatting supersedes an accepted candidate', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    page.arm(); const session = await replySession(page);
+    const selected = await revisionRequest(f, session, { testReply: 'guard selected this' }); await selected.text();
+    const candidate = await revisionRequest(f, session, { testReply: 'candidate awaiting review' }); await candidate.text();
+    page.recovery.stop();
+    let enter, finish;
+    const ready = new Promise(resolve => { enter = resolve; });
+    const fresh = await b.makePage('same-tab', { confirmUnreviewed: async () => true,
+        formatReply: text => { enter(); return new Promise(resolve => { finish = () => resolve(text); }); } });
+    const pending = fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+    await ready; session.complete(selected); finish(); await pending;
+    assert.equal(b.disk.messages.length, 1); assert.equal(b.rendered.length, 0);
+    const next = await b.makePage(); await next.recovery.recover();
+    assert.equal(b.disk.messages[1].mes, 'guard selected this');
+    assert.equal(b.disk.messages[1].extra[b.MARK].reviewIncomplete, undefined);
+    assert.equal(f.calls.length, 2);
 });
