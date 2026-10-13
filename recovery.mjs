@@ -5,6 +5,29 @@ const KEY = 'silly-relay-recovery-v1';
 const MAX_AGE = 2 * 60 * 60 * 1000;
 const needsReview = record => !!(record.jobs || record.reviewing) && !record.finalized;
 
+// Save conflict checks include all JSON message fields, unlike the body-only
+// identity used by old journals. Key order alone is not a change.
+function sameSavedValue(a, b) {
+    if (a === b) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object'
+        || Array.isArray(a) !== Array.isArray(b)) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length
+        && keys.every(key => Object.hasOwn(b, key) && sameSavedValue(a[key], b[key]));
+}
+function preservesSavedChanges(base, latest, local) {
+    if (sameSavedValue(base, latest)) return true;
+    if (!latest || !local || typeof latest !== 'object' || typeof local !== 'object'
+        || Array.isArray(latest) !== Array.isArray(local)) return sameSavedValue(latest, local);
+    if (Array.isArray(latest) && latest.length !== local.length) return false;
+    const before = base && typeof base === 'object' ? base : {};
+    return [...new Set([...Object.keys(before), ...Object.keys(latest)])].every(key => {
+        if (!Object.hasOwn(latest, key)) return !Object.hasOwn(local, key);
+        if (!Object.hasOwn(before, key) && !Object.hasOwn(local, key)) return false;
+        return preservesSavedChanges(before[key], latest[key], local[key]);
+    });
+}
+
 // Change detection, not authentication. Two independent 32-bit lanes work on HTTP
 // origins / older Safari too (crypto.subtle is restricted to secure contexts).
 export function fingerprint(chat) {
@@ -286,11 +309,11 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (typeof message.swipes?.[swipe] === 'string' && message.swipes[swipe] !== text) return null;
         const extra = swipe === selected ? message.extra : message.swipe_info?.[swipe]?.extra;
         return JSON.stringify([found.index, swipe, message.name, !!message.is_user, !!message.is_system,
-            text, message.swipes?.[swipe] ?? text, extra?.display_text ?? null]);
+            text, message.swipes?.[swipe] ?? text, extra ?? {}]);
     }
     function sameCompletedReply(record, left, right) {
         const a = completedReply(record, left), b = completedReply(record, right);
-        return a !== null && a === b;
+        return a !== null && b !== null && sameSavedValue(JSON.parse(a), JSON.parse(b));
     }
     async function release(record) {
         // The logical reply owns every draft buffer. Release them only after
@@ -662,8 +685,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const ctx = getContext();
         // A receive hook may already have saved our final body. Otherwise only
         // write over the disk state we actually observed, never a different reply.
-        if (fingerprint(latest) !== fingerprint(baseline)
-            && fingerprint(latest) !== fingerprint(ctx.chat)) {
+        if (!preservesSavedChanges(baseline, latest, ctx.chat)) {
             throw new Error('복구 도중 서버의 채팅 내용이 바뀌어 저장을 멈췄어요. 다른 기기의 답장을 덮어쓰지 않았어요. 원래 채팅을 다시 열어 확인해 주세요.');
         }
         // This is a browser-side recheck, not an atomic server-wide save lock.
@@ -685,7 +707,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         ctx = getContext();
         if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
             || !sameChat(chatIdentity(ctx), record.identity)) return false;
-        if (fingerprint(latestSaved) !== fingerprint(saved)) {
+        if (!sameSavedValue(latestSaved, saved)) {
             if (position(record, latestSaved)?.done) { await acknowledge(record); return false; }
             throw new Error('복구 준비 중 서버의 채팅 내용이 바뀌어 자동 복구를 멈췄어요. 원래 채팅을 다시 열어 확인해 주세요.');
         }
@@ -701,6 +723,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!position(record, saved)) throw new Error('서버의 채팅 내용이 바뀌어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
         const target = position(record, ctx.chat);
         if (!target) throw new Error('채팅에 새 메시지나 수정이 있어 자동 복구를 멈췄습니다. 기존 답장은 덮어쓰지 않습니다.');
+        if (!sameSavedValue(saved.slice(0, record.count), ctx.chat.slice(0, record.count))) {
+            throw new Error('서버와 현재 페이지의 이전 메시지 기록이 달라 저장을 멈췄어요. 원래 채팅을 다시 열어 확인해 주세요.');
+        }
         const chat = ctx.chat;
         let currentMessage = chat[target.index];
         let currentSwipe = currentMessage?.swipe_id ?? 0;

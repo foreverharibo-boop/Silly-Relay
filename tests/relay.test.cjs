@@ -1861,3 +1861,53 @@ for(const change of ['chat','swipe','message'])test(`late postprocessing cannot 
     assert.equal(b.disk.messages[1].mes,'서버가 끝까지 받은 답장 🤍');
     assert.equal(fresh.recovery.list().length,1);
 });
+
+for (const field of ['display_text', 'sceneFacts', 'swipe_info', 'history', 'deleted']) {
+    test(`recovery preserves remote metadata change: ${field}`, async t => {
+        const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage(); old.arm();
+        const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+            body: '{"type":"normal","duration":5}' });
+        await response.text(); old.recovery.stop(); const fresh = await b.makePage();
+        if (field === 'deleted') {
+            fresh.ctx.chat[0].extra = { obsolete: 'remove me' };
+            b.disk.messages[0].extra = { obsolete: 'remove me' };
+        }
+        let expected;
+        fresh.ctx.eventSource.emit = async (type, index) => {
+            if (type !== 'received') return;
+            if (field === 'history') b.disk.messages[0].extra = { facts: 'new history metadata' };
+            else if (field === 'deleted') delete b.disk.messages[0].extra.obsolete;
+            else if (field === 'swipe_info') b.disk.messages[index].swipe_info[0].extra.facts = 'new swipe metadata';
+            else b.disk.messages[index].extra[field] = { value: 'new remote metadata' };
+            expected = structuredClone(b.disk.messages);
+        };
+        await fresh.recovery.recover();
+        assert.deepEqual(b.disk.messages, expected, 'never overwrite the remote metadata');
+        assert.ok(b.messages.some(message => message.includes('서버의 채팅 내용이 바뀌어')));
+    });
+}
+test('remote metadata changed during formatting stops recovery before rendering', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage(); old.arm();
+    const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: '{"type":"normal","duration":5}' });
+    await response.text(); old.recovery.stop();
+    const fresh = await b.makePage('same-tab', { formatReply: async text => {
+        b.disk.messages[0].extra = { facts: 'new remote facts' }; return text;
+    } });
+    await fresh.recovery.recover();
+    assert.equal(fresh.ctx.chat.length, 1); assert.equal(b.rendered.length, 0);
+    assert.equal(b.disk.messages[0].extra.facts, 'new remote facts');
+    assert.equal(fresh.recovery.list().length, 1);
+});
+test('metadata already updated before recovery is not replaced by stale page history', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage(); old.arm();
+    const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: '{"type":"normal","duration":5}' });
+    await response.text(); old.recovery.stop(); const fresh = await b.makePage();
+    b.disk.messages[0].extra = { display_text: 'new translation already saved' };
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages.length, 1);
+    assert.equal(b.disk.messages[0].extra.display_text, 'new translation already saved');
+    assert.equal(fresh.ctx.chat.length, 1); assert.equal(b.rendered.length, 0);
+    assert.equal(fresh.recovery.list().length, 1);
+});
