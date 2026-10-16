@@ -1712,7 +1712,7 @@ test('a newer final selection during reply formatting supersedes an accepted can
     assert.equal(f.calls.length, 2);
 });
 
-test('matching completion markers with different bodies preserve both versions and retain recovery', async t => {
+test('matching completion receipts retire without inspecting edits or overwriting either version', async t => {
     const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage(); old.arm();
     const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
         body: JSON.stringify({type:'normal',duration:5,testReply:'Long answer with missing section'}) });
@@ -1725,10 +1725,10 @@ test('matching completion markers with different bodies preserve both versions a
     await fresh.recovery.recover();
     assert.equal(fresh.ctx.chat[1].mes,'Short answer');
     assert.equal(b.disk.messages[1].mes,'Long answer with missing section');
-    assert.equal(fresh.recovery.list().length,1);
+    assert.equal(fresh.recovery.list().length,0);
     assert.equal(b.rendered.length,0);
-    assert.ok(b.messages.some(text=>text.includes('현재 화면의 내용이 달라')));
-    assert.equal((await f.request(`/jobs/${jobId}`)).status,200);
+    assert.equal(b.messages.length,0);
+    assert.equal((await f.request(`/jobs/${jobId}`)).status,410);
     const reloaded=await b.makePage();
     assert.equal(reloaded.ctx.chat[1].mes,'Long answer with missing section');
 });
@@ -1826,8 +1826,8 @@ test('a remote save during postprocessing is preserved instead of overwritten by
     await fresh.recovery.recover();await fresh.recovery.settle();
     assert.equal(b.disk.messages[1].mes,'Other device edited reply');
     assert.equal(fresh.ctx.chat[1].mes,'Local processed reply');
-    assert.equal(fresh.recovery.list().length,1);
-    assert.ok(b.messages.some(message=>message.includes('서버의 채팅 내용이 바뀌어')));
+    assert.equal(fresh.recovery.list().length,0);
+    assert.equal(b.messages.length,0);
 });
 
 test('a receive hook may save its own final body before relay saves later metadata',async t=>{
@@ -1887,7 +1887,9 @@ for (const field of ['display_text', 'sceneFacts', 'swipe_info', 'history', 'del
         };
         await fresh.recovery.recover();
         assert.deepEqual(b.disk.messages, expected, 'never overwrite the remote metadata');
-        assert.ok(b.messages.some(message => message.includes('서버의 채팅 내용이 바뀌어')));
+        await fresh.recovery.settle();
+        assert.equal(fresh.recovery.list().length, 0);
+        assert.equal(b.messages.length, 0);
     });
 }
 test('remote metadata changed during formatting stops recovery before rendering', async t => {

@@ -1,10 +1,37 @@
-import { recoveryReason } from './recovery-reasons.mjs?v=1.0.14';
+import { recoveryReason } from './recovery-reasons.mjs?v=1.0.15';
 // Reload recovery: pending request IDs and chat fingerprints only; no response archive.
 export const MARK = 'silly_relay';
 const VALID_ID = /^[a-f0-9]{32}$/;
 const KEY = 'silly-relay-recovery-v1';
 const MAX_AGE = 2 * 60 * 60 * 1000;
 const needsReview = record => !!(record.jobs || record.reviewing) && !record.finalized;
+
+// Only used to recognize an already saved, unmarked reply. Never write this
+// projection back to chat: tags and their contents belong to the user/extensions.
+export function replyBody(text) {
+    if (typeof text !== 'string') return '';
+    const tokens = /<!--[^]*?-->|<\/?[\p{L}_][\p{L}\p{N}_.:-]*(?:\s+(?:[^<>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gu;
+    const stack = [], ranges = [];
+    for (const match of text.matchAll(tokens)) {
+        const token = match[0], start = match.index, end = start + token.length;
+        if (token.startsWith('<!--') || /\/\s*>$/.test(token)) { ranges.push([start, end]); continue; }
+        const name = token.match(/^<\/?([^\s/>]+)/)[1].toLowerCase();
+        if (token.startsWith('</')) {
+            const index = stack.findLastIndex(open => open.name === name);
+            if (index >= 0) { ranges.push([stack[index].start, end]); stack.length = index; }
+        } else stack.push({ name, start });
+    }
+    // Unclosed tags are deliberately retained; they cannot hide the remaining
+    // answer or make unrelated replies match. Nested/overlapping pairs merge.
+    ranges.sort((a, b) => a[0] - b[0]);
+    let body = '', cursor = 0;
+    for (const [start, end] of ranges) {
+        if (start > cursor) body += text.slice(cursor, start);
+        cursor = Math.max(cursor, end);
+    }
+    return (body + text.slice(cursor)).trim();
+}
+const sameReplyBody = (left, right) => !!replyBody(left) && replyBody(left) === replyBody(right);
 
 // Save conflict checks include all JSON message fields, unlike the body-only
 // identity used by old journals. Key order alone is not a change.
@@ -60,7 +87,7 @@ function swipeAnchor(message, count) {
 }
 function completedPosition(record, chat) {
     const matches = mark => mark?.id === record.id && mark.complete
-        && (!record.revision || mark.revision === record.revision);
+        && ((mark.revision || 0) === (record.revision || 0));
     for (let index = 0; index < chat.length; index++) {
         const message = chat[index];
         if (matches(message.extra?.[MARK]) || message.swipe_info?.some(info => matches(info?.extra?.[MARK]))) {
@@ -149,6 +176,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     const warned = new Set();
     const pendingReviews = new Map();
     const receipts = new Map();
+    const quickReceipts = new Map();
     const processing = new Set();
     const sequences = new WeakSet();
     // Volatile capabilities, not journal data. After a page reload the old
@@ -177,7 +205,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // Do not silently evict an unresolved reply.
         if (all.length > 64) throw new Error('복구 대기 요청이 너무 많습니다. 기존 요청을 먼저 확인해 주세요.');
         storage.setItem(storageKey(), JSON.stringify(all));
-        if (!value) { replyReceipts.delete(id); pendingReviews.delete(id); }
+        if (!value) {
+            replyReceipts.delete(id); pendingReviews.delete(id);
+            clearTimeout(quickReceipts.get(id)?.timer); quickReceipts.delete(id);
+        }
     }
     function reportVisibleReply(record) {
         if (record.reviewing && !record.finalized || record.jobs && !record.finalized) return;
@@ -261,17 +292,17 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             || fingerprint(chat.slice(0, record.count)) !== record.anchor) return false;
         const message = chat[record.count];
         if (!message || message.is_user || message.is_system || message.name !== record.name
-            || message.mes !== text) return false;
+            || !sameReplyBody(message.mes, text)) return false;
         const selected = message.swipe_id ?? 0;
         if (message.extra?.[MARK]?.id && message.extra[MARK].id !== record.id) return false;
         const candidateMark = message.swipe_info?.[selected]?.extra?.[MARK];
         if (candidateMark?.id && candidateMark.id !== record.id) return false;
         if (isSwipe(record)) {
             return selected === record.swipeCount && variants(message).length === record.swipeCount + 1
-                && variants(message)[selected] === text
+                && sameReplyBody(variants(message)[selected], text)
                 && swipeAnchor(message, record.swipeCount) === record.swipeAnchor;
         }
-        return selected === 0 && variants(message).length === 1 && variants(message)[0] === text;
+        return selected === 0 && variants(message).length === 1 && sameReplyBody(variants(message)[0], text);
     }
     function showSaved(record, saved) {
         const ctx = getContext();
@@ -279,7 +310,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const target = position(record, ctx.chat);
         if (target?.done) {
             if (!sameCompletedReply(record, ctx.chat, saved)) {
-                warn(record, '저장 완료 표시는 있지만 현재 화면의 내용이 달라 복구 확인을 보류했어요. 수동 수정이 사라지지 않도록 덮어쓰지 않았어요. 내용을 확인한 뒤 원래 채팅을 다시 열어 주세요.');
+                // A completion mark on a different slot/character/revision is
+                // not our receipt. Do not blame ordinary edits or overwrite it.
                 return false;
             }
             reportVisibleReply(record); return true;
@@ -306,21 +338,22 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     function completedReply(record, chat) {
         const found = completedPosition(record, chat);
-        if (!found || found.index !== record.count
-            || fingerprint(chat.slice(0, record.count)) !== record.anchor) return null;
+        if (!found || found.index !== record.count) return null;
         const message = chat[found.index];
+        if (message.is_user || message.is_system || message.name !== record.name) return null;
         const matches = mark => mark?.id === record.id && mark.complete
-            && (!record.revision || mark.revision === record.revision);
+            && ((mark.revision || 0) === (record.revision || 0));
         const selected = message.swipe_id ?? 0;
         const slot = message.swipe_info?.findIndex(info => matches(info?.extra?.[MARK])) ?? -1;
         const swipe = slot >= 0 ? slot : matches(message.extra?.[MARK]) ? selected : -1;
         if (swipe < 0 || isSwipe(record) && swipe !== record.swipeCount) return null;
         const text = swipe === selected ? message.mes : message.swipes?.[swipe];
         if (typeof text !== 'string') return null;
-        if (typeof message.swipes?.[swipe] === 'string' && message.swipes[swipe] !== text) return null;
-        const extra = swipe === selected ? message.extra : message.swipe_info?.[swipe]?.extra;
-        return JSON.stringify([found.index, swipe, message.name, !!message.is_user, !!message.is_system,
-            text, message.swipes?.[swipe] ?? text, extra ?? {}]);
+        // This is a delivery receipt, not a perpetual comparison of the reply.
+        // Once this exact request/revision is complete in memory and on disk,
+        // edits, tag changes, translation metadata and swipe text sync belong
+        // to ST/the user. Retire the journal without rewriting either version.
+        return JSON.stringify([found.index, swipe, message.name, record.id, record.revision || 0]);
     }
     function sameCompletedReply(record, left, right) {
         const a = completedReply(record, left), b = completedReply(record, right);
@@ -369,7 +402,26 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const pending = receipt(record);
         receipts.set(record.id, pending);
         try { return await pending; }
-        finally { receipts.delete(record.id); }
+        finally { receipts.delete(record.id); scheduleReceipt(record.id); }
+    }
+    function scheduleReceipt(id) {
+        const record = list().find(r => r.id === id);
+        if (stopped || !record || needsReview(record) || processing.has(id)
+            || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return;
+        const state = quickReceipts.get(id) || { attempts: 0, timer: null };
+        if (state.timer || state.attempts >= 6) return;
+        state.timer = setTimeout(async () => {
+            state.timer = null;
+            const current = list().find(r => r.id === id);
+            if (stopped || !current || !isVisible()
+                || !sameChat(chatIdentity(getContext()), current.identity)) return;
+            state.attempts++;
+            try { await acknowledge(current); } catch { /* Periodic recovery remains a fallback. */ }
+        }, 500);
+        quickReceipts.set(id, state);
+    }
+    function queueReceipts() {
+        for (const record of list()) scheduleReceipt(record.id);
     }
     function generationStarted(type, options = {}, dryRun = false) {
         generationParents.push({ ticket, generating });
@@ -449,7 +501,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         completeSequence(sequence, selected);
         live.add(record.id);
         tag(record.count, true);
-        setTimeout(() => { if (!stopped) void settle(); }, 500);
+        queueReceipts();
     }
     function completeSequence(sequence, selectedId) {
         if (!sequences.has(sequence) || sequence.closed) return;
@@ -564,7 +616,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             if (data.status < 200 || data.status >= 300) { change(record.id, null); live.delete(record.id); return; }
             change(record.id, { ...record, bytes: data.bytes });
             // Don't let the stream read EOF delete data before ST saves the chat.
-            setTimeout(() => { if (!stopped) void settle(); }, 500);
+            scheduleReceipt(record.id);
         } else if (type === 'cancelled' || type === 'cancel-pending') {
             change(record.id, null); live.delete(record.id);
         } else if (type === 'error') live.delete(record.id);
@@ -707,6 +759,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // A receive hook may already have saved our final body. Otherwise only
         // write over the disk state we actually observed, never a different reply.
         if (!preservesSavedChanges(baseline, latest, ctx.chat)) {
+            // Delivery is already durable. Later edits/metadata are not a
+            // recovery conflict: leave both versions alone and retire quietly.
+            if (sameCompletedReply(record, ctx.chat, latest)) return false;
             throw new Error('복구 도중 서버의 채팅 내용이 바뀌어 저장을 멈췄어요. 다른 기기의 답장을 덮어쓰지 않았어요. 원래 채팅을 다시 열어 확인해 주세요.');
         }
         // This is a browser-side recheck, not an atomic server-wide save lock.
@@ -838,7 +893,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 reportVisibleReply(record);
                 if (!await saveCurrent(record, saved, stillCurrent)) return false;
             }
-        } finally { processing.delete(record.id); }
+        } finally { processing.delete(record.id); scheduleReceipt(record.id); }
         if (await acknowledge(record)) notify(record.reviewIncomplete
             ? '검수 미완료 답장을 직접 복구했어요. 검수를 통과한 답장이라는 뜻은 아니에요.'
             : '다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
@@ -974,7 +1029,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // The guard has returned its selected response. Allow recovery to
         // validate it if ST could not render/save it (e.g. a provider error).
         for (const record of list()) if (record.jobs && record.finalized) live.delete(record.id);
-        setTimeout(() => { if (!stopped) void settle(); }, 500);
+        queueReceipts();
     }
     function generationStopped() {
         generationParents.length = 0;
@@ -984,6 +1039,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             change(record.id, null); live.delete(record.id);
         }
     }
-    function stop() { stopped = true; }
+    function stop() {
+        stopped = true;
+        for (const state of quickReceipts.values()) clearTimeout(state.timer);
+        quickReceipts.clear();
+    }
     return { beginSequence, beginReview, acceptReview, completeReview, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }

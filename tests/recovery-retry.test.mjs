@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRecovery, MARK } from '../recovery.mjs';
+import { createRecovery, MARK, replyBody } from '../recovery.mjs';
 
 const ID = 'a'.repeat(32);
 const PATH = '/api/backends/chat-completions/generate';
@@ -132,4 +132,84 @@ test('failing diagnostic observer cannot interrupt reply recovery', async t => {
     const h = fixture(t, { trace() { throw Error('diagnostic failure'); }, onIdentity() { throw Error('diagnostic failure'); } });
     await h.prepare(); await h.recovery.recover({ manual: true });
     assert.equal(h.ctx.chat[1].mes, TEXT);
+});
+
+test('completed receipt ignores user edits, tags, swipe-text lag and extension metadata without writing', async t => {
+    const h = fixture(t); await h.prepare();
+    h.setDisk([USER, FINAL]);
+    h.ctx.chat.push({ ...structuredClone(FINAL), mes: '<state>new</state>User edited this reply',
+        extra: { ...FINAL.extra, display_text: 'Translation', sceneFacts: { place: 'Room' } } });
+    const before = structuredClone(h.ctx.chat);
+    let saves = 0; h.ctx.saveChat = async () => { saves++; };
+    await h.recovery.settle(); await h.recovery.recover();
+    assert.equal(h.recovery.list().length, 0);
+    assert.deepEqual(h.ctx.chat, before);
+    assert.equal(saves, 0); assert.equal(h.rendered.length, 0); assert.equal(h.events.length, 0);
+    assert.deepEqual(h.notes, []);
+});
+
+test('completed receipt still requires the correct slot, character, request and durable completion', async t => {
+    for (const wrong of ['slot', 'character', 'request', 'revision', 'partial', 'unsaved']) {
+        const h = fixture(t); await h.prepare();
+        const saved = [structuredClone(USER), structuredClone(FINAL)];
+        if (wrong === 'slot') saved.splice(1, 0, { name: 'User', is_user: true, mes: 'another turn' });
+        if (wrong === 'character') saved[1].name = 'Someone else';
+        if (wrong === 'request') saved[1].extra[MARK].id = 'b'.repeat(32);
+        if (wrong === 'revision') saved[1].extra[MARK].revision = 1;
+        if (wrong === 'partial') saved[1].extra[MARK].complete = false;
+        if (wrong === 'unsaved') saved.pop();
+        h.ctx.chat.push(structuredClone(FINAL)); h.setDisk(saved);
+        await h.recovery.settle();
+        assert.equal(h.recovery.list().length, 1, wrong);
+        assert.equal(h.rendered.length, 0, wrong);
+    }
+});
+
+test('tag projection excludes paired nested blocks and comments without changing narrative text', () => {
+    assert.equal(replyBody('<state a="1 > 0"><x>old</x></state>Story<상태>new</상태>'), 'Story');
+    assert.equal(replyBody('Story<state>completely changed</state><!-- note -->'), 'Story');
+    assert.equal(replyBody('<outer><outer>nested</outer>tail</outer>Story'), 'Story');
+    assert.equal(replyBody('Story<state>unfinished'), 'Story<state>unfinished');
+    assert.equal(replyBody('2 < 3 and 5 > 4'), '2 < 3 and 5 > 4');
+    assert.equal(replyBody('<state>metadata only</state>'), '');
+});
+
+test('unmarked saved reply accepts tag-only differences without replaying hooks or overwriting tags', async t => {
+    const h = fixture(t); await h.prepare();
+    const saved = { ...structuredClone(FINAL), mes: `${TEXT}<state>disk</state>`,
+        swipes: [`${TEXT}<state>disk</state>`], extra: {} };
+    h.setDisk([USER, saved]);
+    h.ctx.chat.push({ ...structuredClone(saved), mes: `${TEXT}<state>local</state>`,
+        swipes: [`${TEXT}<state>local</state>`] });
+    let saves = 0; h.ctx.saveChat = async () => { saves++; };
+    await h.recovery.recover();
+    assert.equal(h.recovery.list().length, 0);
+    assert.equal(h.ctx.chat[1].mes, `${TEXT}<state>local</state>`);
+    assert.equal(saves, 0); assert.equal(h.events.length, 0); assert.deepEqual(h.notes, []);
+});
+
+test('receipt retry observes delayed persistence without the ten-second polling loop', async t => {
+    let reads = 0;
+    const h = fixture(t); await h.prepare();
+    h.ctx.chat.push(structuredClone(FINAL));
+    const start = Date.now();
+    await h.recovery.settle();
+    const saved = setTimeout(() => h.setDisk([USER, FINAL]), 700);
+    t.after(() => clearTimeout(saved));
+    while (h.recovery.list().length && Date.now() - start < 2500) {
+        await new Promise(resolve => setTimeout(resolve, 50)); reads++;
+    }
+    assert.ok(reads > 0);
+    assert.equal(h.recovery.list().length, 0);
+    assert.ok(Date.now() - start < 2500);
+    assert.deepEqual(h.notes, []);
+});
+
+test('stopping recovery cancels scheduled receipt checks', async t => {
+    let reads = 0;
+    const h = fixture(t, { fetchImpl: async () => { reads++; return Response.json([{ chat_metadata: {} }, USER]); } });
+    await h.prepare(); await h.recovery.settle(); h.recovery.stop();
+    const before = reads;
+    await new Promise(resolve => setTimeout(resolve, 650));
+    assert.equal(reads, before);
 });
