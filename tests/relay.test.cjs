@@ -34,6 +34,13 @@ async function fixture(t, limits = {}, network = {}) {
         const url = new URL(req.url, 'http://localhost');
         req.query = Object.fromEntries(url.searchParams);
         if (url.pathname === PATH) {
+            if (network.dropGeneration) { req.socket.destroy(); return; }
+            if (network.abortResponse) {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.write('{"partial":');
+                setTimeout(() => res.destroy(), 20);
+                return;
+            }
             if (network.rejectGeneration) return res.status(403).json({ error: 'internal request denied' });
             const call = { user, body: req.body, headers: req.headers, localAddress: req.socket.localAddress,
                 finished: false, cancelled: false };
@@ -201,6 +208,58 @@ test('internal generation does not reconstruct a configured global agent with em
     assert.equal(f.calls.length, 1);
     assert.equal(emptyAgentConstructions, 0);
     assert.equal(http.globalAgent, configured, 'external AI routing stays unchanged');
+});
+
+test('exported server diagnostics distinguish connection reset, response abort and timeout', async t => {
+    for (const [network, timeoutMs, expectedReason, expectedPhase] of [
+        [{ dropGeneration: true }, 1000, 'connection_error', 'connected'],
+        [{ abortResponse: true }, 1000, 'response_aborted', 'body'],
+        [{}, 30, 'timeout', 'connected'],
+    ]) {
+        const directory = await fs.mkdtemp(pathModule.join(os.tmpdir(), 'relay-network-'));
+        t.after(() => fs.rm(directory, { recursive: true, force: true }));
+        const journal = createJournal({ directory });
+        const f = await fixture(t, { journal, timeoutMs }, network);
+        const jobId = id();
+        await f.start(jobId, { duration: 200 });
+        let job;
+        for (let i = 0; i < 100; i++) {
+            job = await f.get(jobId);
+            if (job.state !== 'running') break;
+            await delay(10);
+        }
+        assert.equal(job.state, 'failed');
+        const report = await (await f.request('/diagnostics')).json();
+        const rows = report.events.filter(row => row.id === jobId);
+        const failed = rows.find(row => row.stage === 'failed');
+        assert.equal(failed.reason, expectedReason);
+        assert.equal(failed.phase, expectedPhase);
+        assert.equal(failed.targetKind, 'loopback_ipv4');
+        assert.equal(failed.requestFinished, true);
+        assert.ok(failed.elapsedMs >= 0);
+        assert.equal(rows.filter(row => row.stage === 'failed').length, 1);
+        assert.ok(rows.some(row => row.stage === 'upstream_connected'));
+        if (network.dropGeneration) assert.equal(failed.errorCode, 'ECONNRESET');
+        if (expectedReason === 'timeout') assert.equal(failed.errorCode, 'ETIMEDOUT');
+        if (network.abortResponse) assert.equal(failed.status, 200);
+    }
+});
+
+test('synchronous internal request setup failure is recorded and does not retain an active job', async t => {
+    const rows = [];
+    const f = await fixture(t, { perUserActive: 1, journal: { record: (owner, stage, id, data) => rows.push({ stage, id, ...data }), flush() {} } });
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+    http.request = () => { throw Object.assign(new Error('SECRET_HEADER'), { code: 'ERR_INVALID_CHAR' }); };
+    const jobId = id();
+    await f.start(jobId);
+    http.request = originalRequest;
+    const job = await f.get(jobId);
+    assert.equal(job.state, 'failed');
+    assert.equal(rows.find(row => row.stage === 'failed').errorCode, 'ERR_INVALID_CHAR');
+    assert.equal(rows.find(row => row.stage === 'failed').reason, 'request_setup_error');
+    assert.doesNotMatch(JSON.stringify(rows), /SECRET_HEADER/);
+    assert.equal((await f.start(id(), { duration: 10 })).status, 202);
 });
 
 test('control: ordinary HTTP generation is cancelled when its browser connection closes', async t => {

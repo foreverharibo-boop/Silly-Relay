@@ -4,9 +4,9 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
-const { createJournal } = require('./diagnostics.cjs');
+const { createJournal, errorDetails } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.4';
+const VERSION = '1.0.5';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -73,7 +73,7 @@ function createRelay(overrides = {}) {
             }
         }
     }
-    function finish(job, state, error = '') {
+    function finish(job, state, error = '', details = {}) {
         if (job.state !== 'running') return;
         job.state = state;
         job.error = error;
@@ -82,7 +82,8 @@ function createRelay(overrides = {}) {
         job.upstream = null;
         if (state === 'failed' || state === 'cancelled') release(job);
         job.events.emit('change');
-        trace(job.owner, state, job.id, { status: job.status, bytes: job.size });
+        trace(job.owner, state, job.id, { ...job.diagnostic, ...details,
+            elapsedMs: Math.max(0, job.finishedAt - job.createdAt), status: job.status, bytes: job.size });
         // Metadata only. Never log the body, character names, cookies or keys.
         console.log(`[Silly Relay] ${job.id.slice(0, 8)} ${state} (HTTP ${job.status || 'pending'}, ${job.size} bytes)`);
     }
@@ -165,44 +166,66 @@ function createRelay(overrides = {}) {
         for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-silly-pop', 'accept', 'host']) {
             if (typeof req.headers[name] === 'string') headers[name] = req.headers[name];
         }
-        const address = internalAddress(req.socket);
-        const upstream = http.request({ hostname: address, port: req.socket.localPort,
-            path, method: 'POST', headers, agent: internalAgent }, response => {
-            job.status = response.statusCode || 502;
-            trace(owner, 'upstream_headers', id, { status: job.status });
-            job.contentType = String(response.headers['content-type'] || 'application/octet-stream');
-            job.events.emit('change');
-            const encoding = response.headers['content-encoding'];
-            if (encoding && encoding !== 'identity') {
-                finish(job, 'failed', '압축된 서버 응답은 Silly Relay에서 지원하지 않습니다.');
-                upstream.destroy();
-                return;
-            }
-            // Always drain upstream. A suspended/disconnected browser never owns this socket.
-            response.on('data', chunk => {
-                if (job.state !== 'running') return;
-                if (job.size + chunk.length > limits.responseBytes || totalBytes + chunk.length > limits.totalBytes) {
-                    finish(job, 'failed', '응답 전송 크기 한도를 초과했습니다.');
+        job.diagnostic = { phase: 'setup', requestFinished: false };
+        let upstream;
+        try {
+            const address = internalAddress(req.socket);
+            const agentName = http.globalAgent?.constructor?.name;
+            Object.assign(job.diagnostic, { phase: 'connecting',
+                targetKind: address === '::1' ? 'loopback_ipv6' : address.startsWith('127.') ? 'loopback_ipv4'
+                    : address.includes(':') ? 'interface_ipv6' : 'interface_ipv4',
+                globalAgentKind: agentName === 'PrivateRequestAgent' ? 'private_filter' : agentName === 'ProxyAgent' ? 'proxy'
+                    : http.globalAgent?.constructor === http.Agent ? 'native' : 'other' });
+            trace(owner, 'upstream_connecting', id, job.diagnostic);
+            upstream = http.request({ hostname: address, port: req.socket.localPort,
+                path, method: 'POST', headers, agent: internalAgent }, response => {
+                job.diagnostic.phase = 'headers';
+                job.status = response.statusCode || 502;
+                trace(owner, 'upstream_headers', id, { status: job.status });
+                job.contentType = String(response.headers['content-type'] || 'application/octet-stream');
+                job.events.emit('change');
+                const encoding = response.headers['content-encoding'];
+                if (encoding && encoding !== 'identity') {
+                    finish(job, 'failed', '압축된 서버 응답은 Silly Relay에서 지원하지 않습니다.', { reason: 'compressed_response' });
                     upstream.destroy();
                     return;
                 }
-                job.chunks.push(Buffer.from(chunk));
-                job.size += chunk.length;
-                totalBytes += chunk.length;
-                job.events.emit('change');
+                // Always drain upstream. A suspended/disconnected browser never owns this socket.
+                response.on('data', chunk => {
+                    if (job.state !== 'running') return;
+                    job.diagnostic.phase = 'body';
+                    if (job.size + chunk.length > limits.responseBytes || totalBytes + chunk.length > limits.totalBytes) {
+                        finish(job, 'failed', '응답 전송 크기 한도를 초과했습니다.', { reason: 'response_limit' });
+                        upstream.destroy();
+                        return;
+                    }
+                    job.chunks.push(Buffer.from(chunk));
+                    job.size += chunk.length;
+                    totalBytes += chunk.length;
+                    job.events.emit('change');
+                });
+                response.once('end', () => finish(job, 'completed'));
+                response.once('aborted', () => finish(job, 'failed', '실리태번과 AI 사이 응답이 중간에 끊겼습니다.', { reason: 'response_aborted' }));
+                response.once('error', error => finish(job, 'failed', '서버 응답을 읽지 못했습니다.', { reason: 'response_error', ...errorDetails(error) }));
             });
-            response.once('end', () => finish(job, 'completed'));
-            response.once('aborted', () => finish(job, 'failed', '실리태번과 AI 사이 응답이 중간에 끊겼습니다.'));
-            response.once('error', () => finish(job, 'failed', '서버 응답을 읽지 못했습니다.'));
-        });
-        job.upstream = upstream;
-        upstream.once('error', () => finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.'));
-        job.timer = setTimeout(() => {
-            finish(job, 'failed', '생성 대기 시간이 20분을 넘었습니다.');
-            upstream.destroy();
-        }, limits.timeoutMs);
-        job.timer.unref?.();
-        upstream.end(body);
+            job.upstream = upstream;
+            upstream.once('socket', socket => socket.once('connect', () => {
+                if (job.state !== 'running') return;
+                job.diagnostic.phase = 'connected';
+                trace(owner, 'upstream_connected', id, { ...job.diagnostic, elapsedMs: Math.max(0, Date.now() - job.createdAt) });
+            }));
+            upstream.once('finish', () => { job.diagnostic.requestFinished = true; });
+            upstream.once('error', error => finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.', { reason: 'connection_error', ...errorDetails(error) }));
+            job.timer = setTimeout(() => {
+                finish(job, 'failed', '생성 대기 시간이 20분을 넘었습니다.', { reason: 'timeout', errorCode: 'ETIMEDOUT' });
+                upstream.destroy();
+            }, limits.timeoutMs);
+            job.timer.unref?.();
+            upstream.end(body);
+        } catch (error) {
+            finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.', { reason: 'request_setup_error', ...errorDetails(error) });
+            upstream?.destroy();
+        }
         return job;
     }
     function install(router) {
