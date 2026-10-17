@@ -167,6 +167,42 @@ test('loopback still applies server rejection without an alternate generation at
     assert.equal(f.calls.length, 0);
 });
 
+test('internal generation does not reconstruct a configured global agent with empty options', async t => {
+    // ST replaces http.globalAgent with PrivateRequestAgent or ProxyAgent.
+    // Node's agent:false constructs that class AGAIN, without its options.
+    // Model the private filter: configured loopback is allowed, defaults deny it.
+    let emptyAgentConstructions = 0;
+    class ConfiguredAgent extends http.Agent {
+        constructor(options = {}) {
+            super(options);
+            this.allowSelf = options.allowSelf === true;
+            if (!this.allowSelf) emptyAgentConstructions++;
+        }
+        createConnection(options, callback) {
+            if (this.allowSelf) return super.createConnection(options, callback);
+            process.nextTick(callback, new Error('Blocked request to private IP address'));
+        }
+    }
+    const f = await fixture(t);
+    const originalAgent = http.globalAgent;
+    const configured = new ConfiguredAgent({ allowSelf: true });
+    http.globalAgent = configured;
+    t.after(() => { http.globalAgent = originalAgent; configured.destroy(); });
+    const jobId = id();
+    await f.start(jobId, { duration: 10 });
+    let result;
+    for (let i = 0; i < 50; i++) {
+        result = await f.get(jobId);
+        if (result.state !== 'running') break;
+        await delay(10);
+    }
+    assert.equal(result.state, 'completed', result.error);
+    assert.equal(result.status, 200);
+    assert.equal(f.calls.length, 1);
+    assert.equal(emptyAgentConstructions, 0);
+    assert.equal(http.globalAgent, configured, 'external AI routing stays unchanged');
+});
+
 test('control: ordinary HTTP generation is cancelled when its browser connection closes', async t => {
     const f = await fixture(t);
     const controller = new AbortController();

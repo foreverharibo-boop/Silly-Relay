@@ -6,7 +6,7 @@ const { EventEmitter } = require('node:events');
 
 const { createJournal } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -45,6 +45,12 @@ function ownerOf(req) {
 // Reply bodies remain temporary memory buffers. Only sanitized diagnostics persist.
 function createRelay(overrides = {}) {
     const limits = { ...DEFAULT_LIMITS, ...overrides };
+    // This transport only reaches the SAME accepted ST listener (see start).
+    // agent:false is NOT a native/direct agent: Node constructs the current
+    // global agent's class without options. ST's PrivateRequestAgent then loses
+    // its configured allowlist, and ProxyAgent can inherit an external proxy.
+    // Keep self-requests local without changing ST's global AI routing/filter.
+    const internalAgent = new http.Agent({ keepAlive: false });
     const journal = overrides.journal;
     const trace = (owner, stage, id, data) => { try { journal?.record(owner, stage, id, data); } catch { /* Logging never controls delivery. */ } };
     const jobs = new Map();
@@ -161,7 +167,7 @@ function createRelay(overrides = {}) {
         }
         const address = internalAddress(req.socket);
         const upstream = http.request({ hostname: address, port: req.socket.localPort,
-            path, method: 'POST', headers, agent: false }, response => {
+            path, method: 'POST', headers, agent: internalAgent }, response => {
             job.status = response.statusCode || 502;
             trace(owner, 'upstream_headers', id, { status: job.status });
             job.contentType = String(response.headers['content-type'] || 'application/octet-stream');
@@ -278,6 +284,7 @@ function createRelay(overrides = {}) {
     function close() {
         clearInterval(sweep);
         for (const job of jobs.values()) { cancel(job); remove(job); }
+        internalAgent.destroy();
         return journal?.flush();
     }
     return { install, close };
