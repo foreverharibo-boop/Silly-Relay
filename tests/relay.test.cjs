@@ -2033,3 +2033,23 @@ test('authenticated export connects server lifecycle events and cannot request a
     assert.equal(other.events.length, 0);
     assert.equal((await f.request('/diagnostics', { headers: { cookie: '' } })).status, 401);
 });
+
+test('optional Verba observer receives one completed reply without owning delivery', async t => {
+    const symbol = Symbol.for('verba.relay-observer');
+    const before = globalThis[symbol];
+    t.after(() => { if (before) globalThis[symbol] = before; else delete globalThis[symbol]; });
+    const seen = [];
+    globalThis[symbol] = { apiVersion: 1, complete(owner, ticket, reply) { seen.push({owner,ticket,reply}); } };
+    const f = await fixture(t);
+    const ticket = id(); const jobId = id();
+    await f.start(jobId, { duration: 10, testReply: 'Hello from background.', __verba_server_ticket: ticket });
+    await delay(70);
+    const result = await f.get(jobId);
+    assert.equal(result.state, 'completed');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].owner, 'alice');assert.equal(seen[0].ticket, ticket);
+    assert.match(seen[0].reply.body.toString(), /Hello from background/);
+    assert.equal(f.calls.length, 1);
+    await f.start(jobId, { duration: 10, testReply: 'Hello from background.', __verba_server_ticket: ticket });
+    assert.equal(seen.length, 1, 'duplicate start does not repeat translation');
+});
