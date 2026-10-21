@@ -10,6 +10,9 @@ export function createReplyFilter() {
     let capture = null;
     const current = () => frames.at(-1);
     function generationStarted(type, options = {}, dryRun = false) {
+        // Native dry runs have no matching end event and issue no request.
+        // Keep the live reply binding intact while its prompt is previewed.
+        if (dryRun) return;
         if (frames.length >= 32) frames.length = 0;
         const scoped = !dryRun && !options?.quietToLoud && type === 'quiet' && capture && !capture.used
             && options?.quiet_prompt === capture.prompt ? capture : null;
