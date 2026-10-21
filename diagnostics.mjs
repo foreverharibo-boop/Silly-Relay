@@ -5,7 +5,7 @@ const STAGES = new Set(['browser_ready', 'starting', 'accepted', 'reconnecting',
     'candidate_read', 'candidate_selected', 'candidate_rejected', 'recovery_failed', 'warning',
     'apply_started', 'apply_finished', 'display_applied', 'saved_display_applied', 'hooks_started', 'hooks_finished',
     'save_started', 'save_returned', 'disk_read', 'disk_read_failed', 'durable_verified', 'release_started', 'released',
-    'manual_confirmed', 'manual_cancelled', 'page_hidden', 'page_visible']);
+    'manual_confirmed', 'manual_cancelled', 'page_hidden', 'page_visible', 'read_resumed']);
 const REASONS = new Set(['unknown', 'busy', 'generating', 'stopped', 'hidden', 'live', 'other_chat',
     'journal_changed', 'context_changed', 'not_saved', 'display_mismatch', 'review_pending', 'already_prompted',
     'candidate_failed', 'no_completed_reply', 'candidate_rejected', 'timeout', 'aborted', 'network', 'hook_error']);
@@ -64,7 +64,7 @@ export async function collectDiagnostics({ api, headers, diagnostics, reasons = 
             ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}) };
     }
     const browser = diagnostics.report();
-    return { extension: 'Silly Relay', version: '1.0.15', exportedAt: new Date().toISOString(),
+    return { extension: 'Silly Relay', version: '1.0.17', exportedAt: new Date().toISOString(),
         serverVersion: typeof status?.version === 'string' && /^[0-9.\w-]{1,40}$/.test(status.version) ? status.version : null,
         note: 'Server read means a response was sent, not that the browser displayed or saved it. Browser events describe only this browser. Times use each device clock. No reply bodies, prompts, keys or character/chat names are included. Prior events may be absent due to rotation, limits or storage failures. Push notification delivery is not observed by Relay.',
         reasons, server, browser,

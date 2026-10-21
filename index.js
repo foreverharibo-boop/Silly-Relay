@@ -1,10 +1,10 @@
-import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.16';
-import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.16';
-import { createTransport } from './transport.mjs?v=1.0.16';
-import { createRecovery } from './recovery.mjs?v=1.0.16';
-import { recoveryIdentity } from './identity.mjs?v=1.0.16';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.16';
-import { createReplySessions } from './reply-session.mjs?v=1.0.16';
+import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.17';
+import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.17';
+import { createTransport } from './transport.mjs?v=1.0.17';
+import { createRecovery } from './recovery.mjs?v=1.0.17';
+import { recoveryIdentity } from './identity.mjs?v=1.0.17';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.17';
+import { createReplySessions } from './reply-session.mjs?v=1.0.17';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -52,7 +52,7 @@ function onEvent(type, data) {
     diagnostics?.record(type, data);
     try { recovery?.event(type, data); } catch { /* Recovery cannot cancel the live request. */ }
     const names = { starting: '서버로 요청 전달 중', accepted: '서버에서 생성 중 · 화면을 나가도 수신 계속',
-        reconnecting: '연결 재시도 중 · 서버 작업은 유지됩니다',
+        reconnecting: '연결 재시도 중 · 서버 작업은 유지됩니다', read_resumed: '기존 답변 수신 연결을 다시 여는 중',
         completed: '응답 전달 완료', cancelled: '서버 생성 중지 완료',
         'cancel-pending': '중지 전달 대기 · 연결 복구 후 다시 보냅니다', error: '요청 오류',
         'recovery-unavailable': '이번 요청은 새로고침 복구 없이 진행합니다' };
@@ -78,7 +78,7 @@ async function check() {
         diagnostics?.bind(result.owner);
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.16 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.17 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -192,7 +192,11 @@ function initialize() {
         catch (error) { notify(error.message); }
         finally { button.disabled = false; }
     });
-    function resume() { void flushCancellations(); if (active && tabId) void recovery.recover(); }
+    function resume() {
+        transport.resume();
+        void flushCancellations();
+        if (active && tabId) void recovery.recover();
+    }
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resume(); });
     globalThis.addEventListener('online', resume);
     globalThis.addEventListener('pageshow', resume);

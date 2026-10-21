@@ -33,22 +33,46 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
     saveCancellation = () => {}, prepareRecovery = async () => false,
     requestTimeout = 30000, retryDelay = 1000, startRetryMs = 60000 }) {
     const replySequence = Symbol('silly-relay.reply-sequence');
+    const resumedRead = Symbol('silly-relay.resumed-read');
+    const pendingReads = new Set();
+    // Wake only result GETs. Never resubmit generation or take over chat writes
+    // while the original ST consumer is still alive (including review hooks).
+    function resume() { for (const restart of [...pendingReads]) restart(); }
     function emit(type, detail = {}) { try { onEvent(type, detail); } catch { /* UI never owns the request. */ } }
-    async function api(path, init = {}) {
+    async function api(path, init = {}, { resumable = false, signal } = {}) {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), requestTimeout);
+        let interrupt;
+        const interrupted = new Promise((_, reject) => { interrupt = error => {
+            reject(error);
+            controller.abort();
+        }; });
+        const restart = () => {
+            pendingReads.delete(restart);
+            interrupt(Object.assign(new Error('결과 수신 연결 재개'), { [resumedRead]: true }));
+        };
+        const abort = () => interrupt(abortError());
+        const timer = setTimeout(() => interrupt(new DOMException('서버 응답 대기 시간 초과', 'TimeoutError')), requestTimeout);
+        if (resumable) pendingReads.add(restart);
+        signal?.addEventListener('abort', abort, { once: true });
         try {
-            const response = await fetchImpl(new URL(API + path, origin).href,
-                { ...init, cache: 'no-store', signal: controller.signal });
-            if (!response.ok) {
-                const data = await response.json().catch(() => ({}));
-                throw Object.assign(new Error(data.error || `연결 유지 서버 오류 (HTTP ${response.status})`), { httpStatus: response.status });
-            }
-            return await response.json();
-        } catch (error) {
-            if (controller.signal.aborted) throw new DOMException('서버 응답 대기 시간 초과', 'TimeoutError');
-            throw error;
-        } finally { clearTimeout(timer); }
+            if (signal?.aborted) abort();
+            // Some suspended mobile requests do not settle promptly on abort.
+            // Race the entire fetch AND JSON body read; ignore any stale result.
+            return await Promise.race([interrupted, (async () => {
+                if (controller.signal.aborted) throw abortError();
+                const response = await fetchImpl(new URL(API + path, origin).href,
+                    { ...init, cache: 'no-store', signal: controller.signal });
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    throw Object.assign(new Error(data.error || `연결 유지 서버 오류 (HTTP ${response.status})`), { httpStatus: response.status });
+                }
+                return await response.json();
+            })()]);
+        } finally {
+            clearTimeout(timer);
+            pendingReads.delete(restart);
+            signal?.removeEventListener('abort', abort);
+        }
     }
     async function wrappedFetch(input, init, sequence) {
         sequence ||= init?.[replySequence];
@@ -95,6 +119,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         if (signal?.aborted) { link.dispose(); emit('cancelled', { id }); throw abortError(); }
         let stopped = false;
         let detached = false;
+        const readController = new AbortController();
         let streamController;
         const cleanup = () => { detached = true; signal?.removeEventListener('abort', stop); link.dispose(); };
         async function sendCancel() {
@@ -107,6 +132,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         const stop = () => {
             if (detached || stopped) return;
             stopped = true;
+            readController.abort();
             saveCancellation(id, true);
             void sendCancel();
             try { streamController?.error(abortError()); } catch { /* Already closed. */ }
@@ -152,13 +178,15 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
                 for (;;) {
                     if (stopped) throw abortError();
                     try {
-                        const data = await api(`/jobs/${id}?cursor=${cursor}&wait=1`, { headers, credentials });
+                        const data = await api(`/jobs/${id}?cursor=${cursor}&wait=1`, { headers, credentials },
+                            { resumable: true, signal: readController.signal });
                         if (stopped) throw abortError();
                         if (data.state === 'cancelled') throw abortError();
                         if (data.state === 'failed') throw new Error(data.error || '서버 생성 작업에 실패했습니다.');
                         return data;
                     } catch (error) {
                         if (stopped || error.name === 'AbortError') throw abortError();
+                        if (error[resumedRead]) { emit('read_resumed', { id }); continue; }
                         if (error.httpStatus || !(error instanceof TypeError || error.name === 'TimeoutError')) throw error;
                         emit('reconnecting', { id });
                         await wait(retryDelay);
@@ -219,6 +247,6 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
     const replyFetch = (input, init, sequence, upstream) => typeof upstream === 'function'
         ? upstream(input, { ...init, [replySequence]: sequence })
         : wrappedFetch(input, init, sequence);
-    return { fetch, replyFetch, api };
+    return { fetch, replyFetch, api, resume };
 }
 
