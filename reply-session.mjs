@@ -1,15 +1,44 @@
 // Opt-in contract for an extension that owns a real character reply's revisions.
 // Judge, memory and translation calls must keep using their original fetch.
 export function createReplySessions({ enabled, recovery, transport, consume = () => {}, captureQuiet, onError = () => {} }) {
+    function session(sequence) {
+        if (!sequence) return null;
+        return Object.freeze({
+            checkpoint(value) {
+                if (sequence.recovery?.current) sequence.recovery.current.checkpoint = structuredClone(value);
+            },
+            fetch(input, init, upstream) {
+                if (sequence.closed) return Promise.reject(new Error('이미 끝난 답장 연동입니다.'));
+                return transport.replyFetch(input, init, sequence, upstream);
+            },
+            complete(response) {
+                try { recovery.completeSequence(sequence, response?.headers?.get('x-silly-relay-job')); }
+                catch (error) { onError(error); }
+            },
+            cancel() {
+                try { recovery.cancelSequence(sequence); } catch (error) { onError(error); }
+            },
+        });
+    }
     return Object.freeze({
         apiVersion: 1,
-        beginReview(index, message, signal) {
+        recoveryVersion: 1,
+        expectReview(owner, checkpoint) {
+            if (enabled()) recovery.expectReview(owner, checkpoint);
+        },
+        resume(record, context) {
+            return enabled() ? session(recovery.resumeSequence(record, context)) : null;
+        },
+        beginReview(index, message, signal, options) {
             if (!enabled() || !captureQuiet) return null;
             let sequence;
-            try { sequence = recovery.beginReview(index, message, signal); }
+            try { sequence = recovery.beginReview(index, message, signal, options); }
             catch (error) { onError(error); return null; }
             if (!sequence) return null;
             return Object.freeze({
+                checkpoint(value) {
+                    if (sequence.recovery?.current) sequence.recovery.current.checkpoint = structuredClone(value);
+                },
                 async capture(prompt, action) {
                     if (sequence.closed) throw new Error('이미 끝난 답장 검수입니다.');
                     const previousId = sequence.latestId;
@@ -28,27 +57,14 @@ export function createReplySessions({ enabled, recovery, transport, consume = ()
                 },
             });
         },
-        begin() {
+        begin(options) {
             if (!enabled()) return null;
             let sequence;
-            try { sequence = recovery.beginSequence(); }
+            try { sequence = recovery.beginSequence(options); }
             catch (error) { onError(error); return null; }
             if (!sequence) return null;
             consume();
-            return Object.freeze({
-                fetch(input, init, upstream) {
-                    if (sequence.closed) return Promise.reject(new Error('이미 끝난 답장 연동입니다.'));
-                    return transport.replyFetch(input, init, sequence, upstream);
-                },
-                complete(response) {
-                    try { recovery.completeSequence(sequence, response?.headers?.get('x-silly-relay-job')); }
-                    catch (error) { onError(error); }
-                },
-                cancel() {
-                    try { recovery.cancelSequence(sequence); }
-                    catch (error) { onError(error); }
-                },
-            });
+            return session(sequence);
         },
     });
 }

@@ -23,7 +23,9 @@ export const RECOVERY_REASONS = {
   "guard_22": "서버에 복구할 완료 답장이 없어요.",
   "guard_23": "저장 완료 표시는 있지만 현재 화면의 내용이 달라 복구 확인을 보류했어요. 수동 수정이 사라지지 않도록 덮어쓰지 않았어요. 내용을 확인한 뒤 원래 채팅을 다시 열어 주세요.",
   "guard_24": "답장은 채팅 파일에 저장돼 있지만 현재 화면의 내용이 달라 자동으로 바꾸지 않았어요. 원래 채팅을 다시 열어 주세요.",
-  "guard_25": "답장은 복구했지만 후처리 확장에서 오류가 났습니다."
+  "guard_25": "답장은 복구했지만 후처리 확장에서 오류가 났습니다.",
+  "guard_26": "답장 검수를 마치지 못해 복구를 보류했어요. 서버의 답장은 유지합니다.",
+  "guard_27": "검수 복구 정보를 읽지 못했어요. 릴레이 서버 플러그인 업데이트와 연결 상태를 확인해 주세요. 서버의 답장은 유지합니다."
 };
 export function recoveryReason(error) {
     const known = Object.entries(RECOVERY_REASONS).find(([, message]) => message === error?.message);

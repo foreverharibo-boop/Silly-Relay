@@ -7,7 +7,7 @@ const { EventEmitter } = require('node:events');
 
 const { createJournal, errorDetails } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.7';
+const VERSION = '1.0.8';
 // Optional observer: existing reply transport/recovery owns generation unchanged.
 globalThis[Symbol.for('verba.relay-capability')] = 1;
 const PATHS = new Set([
@@ -61,8 +61,9 @@ function createRelay(overrides = {}) {
     let totalBytes = 0;
     const keyOf = (owner, id) => JSON.stringify([owner, id]);
     function release(job) {
-        if (!job.released) totalBytes -= job.size;
+        if (!job.released) totalBytes -= job.size + (job.recoveryBytes || 0);
         job.chunks = [];
+        job.recovery = null;
         job.released = true;
     }
     function remove(job) {
@@ -146,12 +147,26 @@ function createRelay(overrides = {}) {
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
         } catch { throw fail(400, '생성 요청 본문은 JSON 객체여야 합니다.'); }
         const cleanPayload = JSON.parse(body);
+        // Review snapshots live only beside the temporary response, under the
+        // same account/TTL/memory budget. Never put prompts or keys in journals.
+        let recovery = null, recoveryBytes = 0;
+        if (req.body.recovery?.version === 1) {
+            const value = req.body.recovery;
+            const valid = step => step && /^[a-z][a-z0-9-]{0,39}$/.test(step.owner)
+                && step.checkpoint && typeof step.checkpoint === 'object' && !Array.isArray(step.checkpoint);
+            if (!valid(value.current) || value.after && !valid(value.after)) throw fail(400, '검수 복구 정보가 올바르지 않습니다.');
+            const encoded = JSON.stringify(value);
+            if (Buffer.byteLength(encoded) > 512 * 1024) throw fail(413, '검수 복구 정보 크기 한도입니다.');
+            recovery = { ...JSON.parse(encoded), body };
+            recoveryBytes = Buffer.byteLength(body) + Buffer.byteLength(encoded);
+        }
         const translationTicket = ID.test(cleanPayload.__verba_server_ticket || '') ? cleanPayload.__verba_server_ticket : null;
         delete cleanPayload.__verba_server_ticket;
         // Resolve once after duplicate detection: retries keep the original route.
         let upstreamBody;
         prune();
-        const digest = createHash('sha256').update(path).update('\0').update(body).digest('hex');
+        const digest = createHash('sha256').update(path).update('\0').update(body)
+            .update(recovery ? JSON.stringify(req.body.recovery) : '').digest('hex');
         const existing = jobs.get(keyOf(owner, id));
         if (existing) {
             if (existing.digest && existing.digest !== digest) throw fail(409, '같은 작업 번호에 다른 요청이 들어왔습니다.');
@@ -190,14 +205,15 @@ function createRelay(overrides = {}) {
             throw fail(429, `보관 한도: 이 계정에 전달·저장 확인을 기다리는 요청이 ${ownPending}/${limits.perUserJobs}개 있습니다. 이번 요청은 접수되지 않았습니다.`);
         }
         if (active.length >= limits.active) throw fail(429, '서버 전체 동시 생성 한도입니다. 잠시 뒤 다시 시도해 주세요. 이번 요청은 접수되지 않았습니다.');
-        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || totalBytes >= limits.totalBytes) {
+        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || totalBytes + recoveryBytes >= limits.totalBytes) {
             throw fail(429, '서버 전체 응답 보관 한도입니다. 이번 요청은 접수되지 않았습니다.');
         }
         const job = { owner, id, digest, state: 'running', chunks: [], size: 0,
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
             events: new EventEmitter(), upstream: null, timer: null,
-            translationTicket, notificationTarget, translationBinding };
+            translationTicket, notificationTarget, translationBinding, recovery, recoveryBytes };
         jobs.set(keyOf(owner, id), job);
+        totalBytes += recoveryBytes;
         trace(owner, 'accepted', id);
         const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(upstreamBody),
             'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
@@ -280,13 +296,19 @@ function createRelay(overrides = {}) {
         router.post('/notification-settings', wrap((req, res) => res.json({ target: routing.set(ownerOf(req), req.body?.target) })));
         router.get('/status', wrap((req, res) => {
             const owner = ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, translationObserver: true, notificationRouting: true, notificationTarget: routing.get(owner), diagnosticJournal: !!journal, owner });
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, reviewRecovery: 1, translationObserver: true, notificationRouting: true, notificationTarget: routing.get(owner), diagnosticJournal: !!journal, owner });
         }));
         router.get('/diagnostics', wrap(async (req, res) => {
             const owner = ownerOf(req);
             res.json(journal ? await journal.report(owner) : { unavailable: true, events: [] });
         }));
         router.post('/jobs', wrap((req, res) => res.status(202).json(describe(start(req)))));
+        router.get('/jobs/:id/recovery', wrap((req, res) => {
+            const job = lookup(ownerOf(req), req.params.id);
+            if (!job.recovery || job.released) throw fail(409, '이 답장에는 이어받을 검수 정보가 없습니다.');
+            res.setHeader('Cache-Control', 'no-store');
+            res.json(job.recovery);
+        }));
         router.get('/jobs/:id', wrap((req, res) => {
             const job = lookup(ownerOf(req), req.params.id);
             if (job.state === 'delivered') throw fail(410, '전달이 끝난 응답은 즉시 삭제됩니다.');

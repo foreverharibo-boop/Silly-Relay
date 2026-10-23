@@ -73,6 +73,32 @@ test('failed save retains the buffer while cancelling main retry only once', asy
     assert.equal(h.recovery.list().length, 1); assert.equal(received, 1); assert.equal(h.events.length, 0);
     h.ctx.saveChat = save; await h.recovery.recover();
     assert.equal(h.recovery.list().length, 0); assert.equal(received, 1);
+    assert.equal(h.events.filter(event => event[0] === 'received').length, 1, 'retry must run skipped tag/translation hooks');
+});
+
+test('a swallowed conditional save retries the original file before running hooks', async t => {
+    let retries = 0;
+    const h = fixture(t, { retrySave: async (identity, messages, valid) => {
+        assert.equal(valid(), true); assert.deepEqual(identity, { avatar: 'Char.png', file: 'Chat A' });
+        retries++; h.setDisk(messages);
+    } });
+    await h.prepare(); h.ctx.saveChat = async () => {};
+    await h.recovery.recover();
+    assert.equal(retries, 2, 'initial answer and final postprocessing each have one bounded retry');
+    assert.equal(h.events.filter(event => event[0] === 'received').length, 1);
+    assert.equal(h.recovery.list().length, 0);
+});
+
+test('failed retries keep the response and skip hooks until a verified save succeeds', async t => {
+    let retries = 0;
+    const h = fixture(t, { retrySave: async () => { retries++; } });
+    await h.prepare(); const save = h.ctx.saveChat; h.ctx.saveChat = async () => {};
+    await h.recovery.recover();
+    assert.equal(retries, 1); assert.equal(h.events.length, 0); assert.equal(h.recovery.list().length, 1);
+    h.ctx.saveChat = save;
+    await h.recovery.recover();
+    assert.equal(h.events.filter(event => event[0] === 'received').length, 1);
+    assert.equal(h.recovery.list().length, 0);
 });
 
 test('already visible durable reply without marker reports receipt without duplicate render', async t => {

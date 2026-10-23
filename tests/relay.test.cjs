@@ -1334,6 +1334,203 @@ const revisionRequest = (f, session, body) => session.fetch(f.base + PATH, {
     method: 'POST', headers: AUTH, body: JSON.stringify({ type: 'normal', duration: 5, ...body }),
 });
 
+async function recoverableReview(page, f, after) {
+    const { createReplySessions } = await import('../reply-session.mjs');
+    const sessions = createReplySessions({ enabled: () => true, recovery: page.recovery, transport: page.transport });
+    page.arm();
+    if (after) sessions.expectReview('hundredlog', { facts: ['frozen fact'], mode: 'normal' });
+    const session = sessions.begin({ owner: 'ttotto', checkpoint: { attempt: 0, rule: 'frozen ban' } });
+    const response = await revisionRequest(f, session, { testReply: 'Retained draft' }); await response.text();
+    return { sessions, session, response, jobId: response.headers.get('x-silly-relay-job') };
+}
+
+test('review snapshots are account isolated, temporary, bounded and absent from the browser journal', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();
+    const h = await recoverableReview(page, f, true);
+    const info = await (await f.request(`/jobs/${h.jobId}/recovery`)).json();
+    assert.equal(info.current.owner, 'ttotto'); assert.equal(info.after.owner, 'hundredlog');
+    assert.equal(info.current.checkpoint.rule, 'frozen ban');
+    assert.equal(JSON.parse(info.body).testReply, 'Retained draft');
+    assert.doesNotMatch(JSON.stringify(page.recovery.list()), /frozen ban|frozen fact|Retained draft/);
+    assert.equal((await f.request(`/jobs/${h.jobId}/recovery`, { headers: { cookie: 'user=bob' } })).status, 404);
+    await f.request(`/jobs/${h.jobId}/ack`, { method: 'POST', body: JSON.stringify({ cursor: (await f.get(h.jobId)).bytes }) });
+    assert.equal((await f.request(`/jobs/${h.jobId}/recovery`)).status, 409);
+    const oversized = { version: 1, current: { owner: 'ttotto', checkpoint: { huge: 'x'.repeat(512 * 1024) } } };
+    assert.equal((await f.request('/jobs', { method: 'POST', body: JSON.stringify({ id: id(), path: PATH, body: '{}', recovery: oversized }) })).status, 413);
+    assert.equal(f.calls.length, 1);
+});
+
+for (const rewrite of [false, true]) test(`resumable transport review restores its selected reply without regenerating the original, rewrite=${rewrite}`, async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const h = await recoverableReview(old, f); old.recovery.stop();
+    let fresh, resumes = 0;
+    fresh = await b.makePage('same-tab', { resumeReview: async data => {
+        resumes++; assert.equal(data.checkpoint.checkpoint.rule, 'frozen ban');
+        const { createReplySessions } = await import('../reply-session.mjs');
+        const session = createReplySessions({ enabled: () => true, recovery: fresh.recovery, transport: fresh.transport }).resume(data.record, data.context);
+        const response = rewrite ? await revisionRequest(f, session, { testReply: 'Approved rewrite' })
+            : new Response(data.raw, { headers: { 'x-silly-relay-job': data.record.jobId } });
+        if (rewrite) await response.text();
+        session.complete(response); return { resumed: true };
+    } });
+    await fresh.recovery.recover();
+    assert.equal(resumes, 1); assert.equal(b.disk.messages[1].mes, rewrite ? 'Approved rewrite' : 'Retained draft');
+    assert.equal(f.calls.length, rewrite ? 2 : 1);
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal((await f.request(`/jobs/${h.jobId}`)).status, 410);
+});
+
+for (const rewrite of [false, true]) test(`transport review then message review resumes in order and displays only the final reply, rewrite=${rewrite}`, async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const h = await recoverableReview(old, f, true); old.recovery.stop();
+    const stages = [], displayed = []; let fresh;
+    fresh = await b.makePage('same-tab', { resumeReview: async data => {
+        stages.push(data.checkpoint.owner);
+        if (data.checkpoint.owner === 'ttotto') {
+            const sequence = fresh.recovery.resumeSequence(data.record, data.context);
+            fresh.recovery.completeSequence(sequence, data.record.jobId); return { resumed: true };
+        }
+        return { postprocess: async (index, message) => {
+            assert.equal(displayed.length, 0, 'pending semantic draft must stay off screen');
+            const sequence = fresh.recovery.beginReview(index, message, new AbortController().signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            assert.ok(sequence);
+            if (rewrite) {
+                const response = await fresh.transport.replyFetch(f.base + PATH, { method: 'POST', headers: AUTH,
+                    body: JSON.stringify({ type: 'quiet', duration: 5, testReply: 'Continuity corrected' }) }, sequence);
+                const text = (await response.json()).choices[0].message.content;
+                fresh.recovery.acceptReview(sequence, text); message.mes = text;
+            }
+            fresh.recovery.completeReview(sequence, message);
+        } };
+    } });
+    fresh.ctx.addOneMessage = message => displayed.push(message.mes);
+    fresh.ctx.updateMessageBlock = () => {};
+    fresh.ctx.eventSource.emit = async (type, index) => {
+        if (type === 'received') fresh.ctx.chat[index].extra.display_text = '기존 번역 재사용';
+    };
+    await fresh.recovery.recover();
+    assert.deepEqual(stages, ['ttotto', 'hundredlog']);
+    assert.deepEqual(displayed, [rewrite ? 'Continuity corrected' : 'Retained draft']);
+    assert.equal(b.disk.messages[1].extra.display_text, '기존 번역 재사용');
+    assert.equal(fresh.recovery.list().length, 0);
+    assert.equal(f.calls.length, rewrite ? 2 : 1);
+    assert.equal((await f.request(`/jobs/${h.jobId}`)).status, 410);
+});
+
+test('an unavailable reviewer retains candidates and can resume after its extension finishes loading', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const h = await recoverableReview(old, f); old.recovery.stop(); let ready = false, fresh;
+    fresh = await b.makePage('same-tab', { resumeReview: async data => {
+        if (!ready) return null;
+        fresh.recovery.completeSequence(fresh.recovery.resumeSequence(data.record, data.context), data.record.jobId);
+        return { resumed: true };
+    } });
+    await fresh.recovery.recover(); assert.equal(b.disk.messages.length, 1);
+    assert.equal((await f.request(`/jobs/${h.jobId}`)).status, 200);
+    ready = true; await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1].mes, 'Retained draft'); assert.equal(f.calls.length, 1);
+});
+
+test('native reply declares a future message review before its request, even without a transport guard', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const { createReplySessions } = await import('../reply-session.mjs');
+    old.arm();
+    createReplySessions({ enabled: () => true, recovery: old.recovery, transport: old.transport }).expectReview('hundredlog', { facts: ['original fact'] });
+    const response = await old.transport.fetch(f.base + PATH, { method: 'POST', headers: AUTH,
+        body: JSON.stringify({ type: 'normal', duration: 5, testReply: 'Native retained' }) });
+    await response.text(); old.recovery.stop(); let fresh;
+    fresh = await b.makePage('same-tab', { resumeReview: async data => {
+        assert.equal(data.checkpoint.owner, 'hundredlog');
+        return { postprocess: async (index,message) => {
+            const review = fresh.recovery.beginReview(index,message,new AbortController().signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            assert.ok(review); fresh.recovery.completeReview(review,message);
+        } };
+    } });
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1].mes, 'Native retained');
+    assert.equal(fresh.recovery.list().length, 0); assert.equal(f.calls.length, 1);
+});
+
+for (const rewrite of [false, true]) for (const savedDraft of [false, true])
+test(`an interrupted message review reopens its own pending journal, rewrite=${rewrite}, savedDraft=${savedDraft}`, async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const h = await recoverableReview(old, f, true); h.session.complete(h.response);
+    const message = { name: 'Character', is_user: false, mes: 'Retained draft', swipes: ['Retained draft'], swipe_id: 0,
+        extra: {}, swipe_info: [{ extra: {} }] };
+    old.ctx.chat.push(message);
+    const checkpoint = { facts: ['frozen fact'], mode: 'normal' };
+    const sequence = old.recovery.beginReview(1,message,new AbortController().signal,{ owner: 'hundredlog',checkpoint });
+    assert.ok(sequence);
+    if (savedDraft) await old.ctx.saveChat();
+    if (rewrite) {
+        const response = await old.transport.replyFetch(f.base + PATH, { method: 'POST', headers: AUTH,
+            body: JSON.stringify({ type: 'quiet', duration: 5, testReply: 'Already rewritten' }) },sequence);
+        await response.text();
+    }
+    old.recovery.stop(); let fresh;
+    fresh = await b.makePage('same-tab', { resumeReview: async data => {
+        assert.equal(data.checkpoint.owner,'hundredlog');
+        return { postprocess: async (index,candidate) => {
+            const resumed = fresh.recovery.beginReview(index,candidate,new AbortController().signal,
+                { owner: 'hundredlog',checkpoint:data.checkpoint.checkpoint,resuming:true });
+            assert.ok(resumed,'the interrupted review must be adoptable after reload');
+            fresh.recovery.completeReview(resumed,candidate);
+        } };
+    } });
+    await fresh.recovery.recover();
+    assert.equal(b.disk.messages[1].mes,rewrite?'Already rewritten':'Retained draft');
+    assert.equal(fresh.recovery.list().length,0); assert.equal(f.calls.length,rewrite?2:1);
+});
+
+test('missing review context does not delete a completed answer and still permits explicit manual recovery', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const h = await recoverableReview(old, f); old.recovery.stop();
+    const fresh = await b.makePage('same-tab', { api: (path, init) => path.endsWith('/recovery')
+        ? Promise.reject(Object.assign(Error('old server'), { httpStatus: 404 })) : old.transport.api(path, init),
+        confirmUnreviewed: async () => true });
+    await fresh.recovery.recover(); assert.equal(fresh.recovery.list().length, 1);
+    assert.equal((await f.request(`/jobs/${h.jobId}`)).status, 200);
+    await fresh.recovery.recover({ manual: true, allowUnreviewed: true });
+    assert.equal(b.disk.messages[1].mes, 'Retained draft'); assert.equal(f.calls.length, 1);
+});
+
+test('an oversized optional snapshot cannot suppress or duplicate the original generation', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t,f), page = await b.makePage();
+    const { createReplySessions } = await import('../reply-session.mjs'); page.arm();
+    const session = createReplySessions({ enabled: () => true, recovery: page.recovery, transport: page.transport })
+        .begin({ owner: 'ttotto', checkpoint: { rules: 'x'.repeat(512 * 1024) } });
+    const response = await revisionRequest(f,session,{testReply:'Original still delivered'});
+    assert.equal((await response.json()).choices[0].message.content,'Original still delivered');
+    assert.equal(f.calls.length,1); assert.equal(page.recovery.list().length,0);
+});
+
+test('a second interruption during message review preserves the saved draft anchor and leaves no hidden phantom reply', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t,f), old = await b.makePage();
+    const h = await recoverableReview(old,f,true); h.session.complete(h.response);
+    const message = { name:'Character',is_user:false,mes:'Retained draft',swipes:['Retained draft'],swipe_id:0,extra:{},swipe_info:[{extra:{}}] };
+    old.ctx.chat.push(message);
+    const checkpoint={facts:['original fact'],mode:'normal'};
+    const review=old.recovery.beginReview(1,message,new AbortController().signal,{owner:'hundredlog',checkpoint});
+    await old.ctx.saveChat();
+    const correction=await old.transport.replyFetch(f.base+PATH,{method:'POST',headers:AUTH,
+        body:JSON.stringify({type:'quiet',duration:5,testReply:'Retained correction'})},review);await correction.text();old.recovery.stop();
+    let page,interrupt=true;
+    const resumeReview=async data=>({postprocess:async(index,candidate)=>{
+        const resumed=page.recovery.beginReview(index,candidate,new AbortController().signal,
+            {owner:'hundredlog',checkpoint:data.checkpoint.checkpoint,resuming:true});assert.ok(resumed);
+        if(interrupt)throw Error('another page interruption');
+        page.recovery.completeReview(resumed,candidate);
+    }});
+    page=await b.makePage('same-tab',{resumeReview});await page.recovery.recover();
+    assert.equal(page.ctx.chat[1].mes,'Retained draft','unrendered provisional candidate is rolled back');
+    assert.equal(b.disk.messages[1].mes,'Retained draft');page.recovery.stop();
+    interrupt=false;page=await b.makePage('same-tab',{resumeReview});await page.recovery.recover();
+    assert.equal(b.disk.messages[1].mes,'Retained correction');assert.equal(page.recovery.list().length,0);
+    assert.equal(f.calls.length,2);
+});
+
 test('selected JSON/SSE revision survives a fresh page as one reply; every draft waits for durable save', async t => {
     for (const stream of [false, true]) {
         const f = await fixture(t), b = await recoveryBrowser(t, f), page = await b.makePage();

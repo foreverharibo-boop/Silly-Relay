@@ -110,7 +110,8 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         // Persist the binding BEFORE submitting a billable request. Recoverable replies
         // are acknowledged by the chat layer only after the saved message is verified.
         let retainForRecovery = false;
-        try { retainForRecovery = await prepareRecovery({ id, path: url.pathname, body, sequence }); }
+        const recoveryRequest = { id, path: url.pathname, body, sequence };
+        try { retainForRecovery = await prepareRecovery(recoveryRequest); }
         catch (error) {
             // Recovery is optional. A failed journal/capability check must never
             // suppress the one original AI request or retry it by another route.
@@ -140,7 +141,8 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         signal?.addEventListener('abort', stop, { once: true });
         emit('starting', { id });
         const startedAt = Date.now();
-        const envelope = JSON.stringify({ id, path: url.pathname, body });
+        const envelope = JSON.stringify({ id, path: url.pathname, body,
+            ...(retainForRecovery && recoveryRequest.recovery ? { recovery: recoveryRequest.recovery } : {}) });
         let startInfo;
         try {
             while (!startInfo) {

@@ -1,10 +1,10 @@
-import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.19';
-import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.19';
-import { createTransport } from './transport.mjs?v=1.0.19';
-import { createRecovery } from './recovery.mjs?v=1.0.19';
-import { recoveryIdentity } from './identity.mjs?v=1.0.19';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.19';
-import { createReplySessions } from './reply-session.mjs?v=1.0.19';
+import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.20';
+import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.20';
+import { createTransport } from './transport.mjs?v=1.0.20';
+import { createRecovery } from './recovery.mjs?v=1.0.20';
+import { recoveryIdentity } from './identity.mjs?v=1.0.20';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.20';
+import { createReplySessions } from './reply-session.mjs?v=1.0.20';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -20,6 +20,7 @@ let notificationTarget = 'legacy';
 let notificationRevision = 0;
 let recovery;
 let diagnostics;
+let sessions;
 const replies = createReplyFilter();
 const allowWarning = createWarningGate();
 const context = () => globalThis.SillyTavern?.getContext?.();
@@ -82,7 +83,7 @@ async function check() {
         if (result.notificationRouting && revision === notificationRevision) { notificationTarget = result.notificationTarget; panel.querySelector('[data-pop-target]').value = notificationTarget; }
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.19 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.20 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -118,6 +119,32 @@ function initialize() {
             return bridge?.apiVersion === 1 ? bridge.capture(identity) : null;
         },
         allowPreviousSession: standalone,
+        retrySave: async (identity, chatData, valid) => {
+            const native = await import('/script.js');
+            const started = Date.now();
+            while (native.isChatSaving) {
+                if (!valid() || Date.now() - started > 3000) return;
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            if (!valid()) return;
+            await native.saveChat({ chatName: identity.file, chatData });
+        },
+        resumeReview: async data => {
+            const reviewer = globalThis.sillyRelayReviewers?.[data.checkpoint.owner];
+            if (!reviewer?.resume) return null;
+            const options = { checkpoint: data.checkpoint.checkpoint };
+            if (reviewer.kind === 'message') return {
+                postprocess: (index, message) => reviewer.resume({ ...options, index, message }),
+            };
+            const session = sessions.resume(data.record, data.context);
+            if (!session) return null;
+            await reviewer.resume({ ...options, session, body: JSON.parse(data.context.body),
+                response: new Response(data.raw, { status: 200, headers: {
+                    'content-type': data.record.stream ? 'text/event-stream' : 'application/json',
+                    'x-silly-relay-job': data.record.jobId || data.record.id,
+                } }) });
+            return { resumed: true };
+        },
         confirmUnreviewed: async () => globalThis.confirm('검수가 끝나지 않은 답장이에요. 가장 최근에 생성이 완료된 후보를 채팅에 복구할까요?\n\n검수를 통과했다는 뜻은 아니며, 아직 실행하지 않은 검수를 이어서 진행하지는 않아요. 취소하면 답장은 서버의 임시 보관 기간 동안 유지돼요.'),
         isVisible: () => active && document.visibilityState !== 'hidden',
         parser: async () => ({ extract: context().extractMessageFromData,
@@ -135,7 +162,7 @@ function initialize() {
             else notify(message);
         } });
     hook = transport.fetch;
-    globalThis.sillyRelayReplies = createReplySessions({ enabled: () => active && !!tabId,
+    sessions = globalThis.sillyRelayReplies = createReplySessions({ enabled: () => active && !!tabId,
         recovery, transport, consume: replies.consume, captureQuiet: replies.captureQuiet,
         onError: error => onEvent('recovery-unavailable', { message: error.message || '수정본 복구 기록 실패' }) });
     globalThis.fetch = hook;

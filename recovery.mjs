@@ -1,10 +1,11 @@
-import { recoveryReason } from './recovery-reasons.mjs?v=1.0.15';
+import { recoveryReason } from './recovery-reasons.mjs?v=1.0.20';
 // Reload recovery: pending request IDs and chat fingerprints only; no response archive.
 export const MARK = 'silly_relay';
 const VALID_ID = /^[a-f0-9]{32}$/;
 const KEY = 'silly-relay-recovery-v1';
 const MAX_AGE = 2 * 60 * 60 * 1000;
-const needsReview = record => !!(record.jobs || record.reviewing) && !record.finalized;
+const needsReview = record => record.resumeReview === 1 ? !!record.reviewOwner
+    : !!(record.jobs || record.reviewing) && !record.finalized;
 
 // Only used to recognize an already saved, unmarked reply. Never write this
 // projection back to chat: tags and their contents belong to the user/extensions.
@@ -164,10 +165,12 @@ export function decodeReply(raw, record, { extract, streamChunk, showThoughts = 
 export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage, tabId,
     formatReply = async text => text, parser = async () => ({}), notify = () => {}, diagnostic = () => {},
     isVisible = () => true, allowPreviousSession = false, captureReplyReceipt = () => null,
-    confirmUnreviewed = async () => false, trace: observer = () => {}, onIdentity = () => {} }) {
+    confirmUnreviewed = async () => false, trace: observer = () => {}, onIdentity = () => {},
+    resumeReview = async () => null, retrySave = null }) {
     function trace(stage, record, detail = {}) {
         try { observer(stage, { id: record?.id, jobId: record?.jobId || record?.id,
             selectedId: record?.selectedId, count: record?.count, revision: record?.revision,
+            reviewer: record?.reviewOwner,
             reviewPending: !!record && needsReview(record), ...detail }); } catch { /* Diagnostics cannot affect recovery. */ }
     }
     let owner = null, ticket = null, generating = false, busy = false;
@@ -379,7 +382,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return true;
     }
     async function receipt(record) {
-        if (needsReview(record) || processing.has(record.id)) return false;
+        if (needsReview(record) || record.postprocessPending || processing.has(record.id)) return false;
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
@@ -443,14 +446,34 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             ticket.request = data;
         }
     }
-    function beginSequence() {
+    const reviewStep = (owner, checkpoint) => /^[a-z][a-z0-9-]{0,39}$/.test(owner || '')
+        && checkpoint && typeof checkpoint === 'object' ? { owner, checkpoint: structuredClone(checkpoint) } : null;
+    function expectReview(owner, checkpoint) {
+        if (!ticket || !sameChat(ticket.identity, chatIdentity(getContext()))) return false;
+        ticket.review = reviewStep(owner, checkpoint);
+        return !!ticket.review;
+    }
+    function beginSequence(options = {}) {
         if (!ticket?.armed || !sameChat(ticket.identity, chatIdentity(getContext()))) return null;
         const sequence = { ticket, id: null, closed: false };
+        const current = reviewStep(options.owner, options.checkpoint);
+        if (current) sequence.recovery = { version: 1, current,
+            ...(ticket.review ? { after: ticket.review } : {}) };
         ticket = null;
         sequences.add(sequence);
         return sequence;
     }
-    function beginReview(index, message, signal) {
+    function resumeSequence(record, context) {
+        if (generating || !unchanged(record) || !sameChat(record.identity, chatIdentity(getContext()))
+            || stopped || !isVisible()) return null;
+        const sequence = { id: record.id, closed: false, resuming: true,
+            ticket: { armed: true, type: isSwipe(record) ? 'swipe' : 'normal', identity: record.identity },
+            recovery: structuredClone(context) };
+        delete sequence.recovery.body;
+        sequences.add(sequence);
+        return sequence;
+    }
+    function beginReview(index, message, signal, options = {}) {
         const ctx = getContext(), identity = chatIdentity(ctx);
         if (!identity || signal?.aborted || ctx.chat[index] !== message || ctx.chat.length !== index + 1
             || message.is_user || message.is_system) return null;
@@ -460,7 +483,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             const markedId = isSwipe(record) ? message.swipe_info?.[record.swipeCount]?.extra?.[MARK]?.id
                 : message.extra?.[MARK]?.id;
             return record.count === index && sameChat(record.identity, identity)
-                && !record.reviewing && (!markedId || markedId === record.id)
+                && (!record.reviewing || options.resuming && record.resumeReview === 1 && record.reviewOwner === options.owner)
+                && (!markedId || markedId === record.id)
                 && fingerprint(ctx.chat.slice(0, index)) === record.anchor
                 && (!isSwipe(record) || message.swipe_id === record.swipeCount
                     && swipeAnchor(message, record.swipeCount) === record.swipeAnchor);
@@ -471,12 +495,18 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             source: original.source, includeReasoning: original.includeReasoning, model: original.model, bytes: original.bytes }];
         const selectedId = original.selectedId || sourceId(original);
         const record = { ...original, jobs, selectedId, jobId: selectedId, finalized: false, reviewing: true,
-            revision: (original.revision || 0) + 1, reviewBase: fingerprint([message]) };
+            revision: (original.revision || 0) + 1,
+            reviewBase: options.resuming && original.reviewBase || fingerprint([message]) };
+        const current = reviewStep(options.owner, options.checkpoint);
+        if (current) Object.assign(record, { resumeReview: 1, reviewOwner: current.owner, afterReviewOwner: null,
+            reviewAttempt: current.checkpoint.attempt || 0 });
         change(record.id, record);
         live.add(record.id);
         const sequence = { id: record.id, closed: false, signal,
             ticket: { armed: true, type: isSwipe(record) ? 'swipe' : 'normal', identity },
             message, baseText: message.mes, baseId: selectedId, acceptedId: selectedId, acceptedText: message.mes };
+        sequence.resuming = !!options.resuming;
+        if (current) sequence.recovery = { version: 1, current };
         sequences.add(sequence);
         trace('review_started', record);
         message.extra ||= {};
@@ -504,6 +534,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         completeSequence(sequence, selected);
         live.add(record.id);
         tag(record.count, true);
+        if (sequence.resuming) live.delete(record.id);
         queueReceipts();
     }
     function completeSequence(sequence, selectedId) {
@@ -513,18 +544,22 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!record) return;
         const selected = record.jobs.find(job => job.id === selectedId);
         if (selected) change(record.id, { ...record, ...selected, id: record.id,
-            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false, reviewIncomplete: false });
+            jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false, reviewIncomplete: false,
+            ...(record.resumeReview === 1 ? { reviewOwner: record.afterReviewOwner || null, afterReviewOwner: null,
+                reviewAttempt: 0 } : {}) });
         // No selected response means an interrupted review. Keep candidates
         // for explicit recovery, without treating body completion as approval.
         else live.delete(record.id);
         trace('review_finalized', record, { selectedId, applied: !!selected });
+        if (sequence.resuming) live.delete(record.id);
     }
     function cancelSequence(sequence) {
         if (!sequences.has(sequence)) return;
         sequence.closed = true;
-        if (sequence.id) { change(sequence.id, null); live.delete(sequence.id); }
+        if (sequence.id) { if (!sequence.resuming) change(sequence.id, null); live.delete(sequence.id); }
     }
-    async function prepare({ id, path, body, sequence }) {
+    async function prepare(request) {
+        const { id, path, body, sequence } = request;
         const data = JSON.parse(body);
         if (sequence && (!sequences.has(sequence) || sequence.closed)) return false;
         const pending = sequence?.ticket || ticket;
@@ -564,6 +599,15 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             includeReasoning: typeof data.include_reasoning === 'boolean' ? data.include_reasoning
                 : ctx.chatCompletionSettings?.show_thoughts === true,
             model: typeof data.model === 'string' ? data.model : '', bytes: null };
+        const resume = sequence?.recovery || (!root && pending.review ? { version: 1, current: pending.review } : null);
+        if (resume) {
+            if (new TextEncoder().encode(JSON.stringify(resume)).length > 512 * 1024) {
+                throw new Error('검수 재개 정보가 커서 이번 답장은 새로고침 복구 없이 진행합니다.');
+            }
+            request.recovery = structuredClone(resume);
+            Object.assign(record, { resumeReview: 1, reviewOwner: resume.current.owner,
+                afterReviewOwner: resume.after?.owner || null, reviewAttempt: resume.current.checkpoint.attempt || 0 });
+        }
         if (!root && swipe) {
             record.swipeCount = previous.swipes.length;
             record.swipeAnchor = swipeAnchor(previous, record.swipeCount);
@@ -573,6 +617,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 includeReasoning: record.includeReasoning, model: record.model, bytes: null };
             record = { ...(root || record), ...job, id: root?.id || id, jobId: id,
                 jobs: [...(root?.jobs || []), job], selectedId: null, finalized: false };
+            if (resume) Object.assign(record, { resumeReview: 1, reviewOwner: resume.current.owner,
+                afterReviewOwner: resume.after?.owner || null, reviewAttempt: resume.current.checkpoint.attempt || 0 });
         }
         // ST already saves a normal user message before generating. Do not call
         // saveChat or read the entire chat on this critical path: a delayed save,
@@ -636,7 +682,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             if (isSwipe(record) && (message.swipe_id !== record.swipeCount
                 || swipeAnchor(message, record.swipeCount) !== record.swipeAnchor)) continue;
             message.extra ||= {};
-            const canComplete = complete && (!record.jobs || record.finalized);
+            const canComplete = complete && !needsReview(record);
             const alreadyComplete = message.extra[MARK]?.id === record.id && message.extra[MARK].complete;
             message.extra[MARK] = { id: record.id, complete: !!canComplete || !!alreadyComplete,
                 ...(record.revision ? { revision: record.revision } : {}) };
@@ -687,7 +733,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const decoding = { ...await parser(),
             showThoughts: getContext()?.chatCompletionSettings?.show_thoughts === true };
         const candidates = record.jobs
-            ? (record.selectedId ? record.jobs.filter(job => job.id === record.selectedId) : [...record.jobs].reverse())
+            ? (record.selectedId && !(record.resumeReview === 1 && needsReview(record))
+                ? record.jobs.filter(job => job.id === record.selectedId) : [...record.jobs].reverse())
             : [record];
         const failures = [];
         let missingError, undecoded = false;
@@ -764,24 +811,41 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (!preservesSavedChanges(baseline, latest, ctx.chat)) {
             // Delivery is already durable. Later edits/metadata are not a
             // recovery conflict: leave both versions alone and retire quietly.
-            if (sameCompletedReply(record, ctx.chat, latest)) return false;
+            if (sameCompletedReply(record, ctx.chat, latest)) {
+                change(record.id, { ...record, postprocessPending: false });
+                return false;
+            }
             throw new Error('복구 도중 서버의 채팅 내용이 바뀌어 저장을 멈췄어요. 다른 기기의 답장을 덮어쓰지 않았어요. 원래 채팅을 다시 열어 확인해 주세요.');
         }
         // This is a browser-side recheck, not an atomic server-wide save lock.
         await ctx.saveChat();
         trace('save_returned', record);
+        if (!stillCurrent()) return false;
+        let saved = await diskChat(record);
+        if (!stillCurrent()) return false;
+        const matchesSnapshot = value => sameSavedValue(JSON.parse(JSON.stringify(ctx.chat)), value);
+        if (!matchesSnapshot(saved) && retrySave) {
+            // Conditional native saves can time out or swallow an error. Retry
+            // once with the explicit original filename, never force an overwrite.
+            if (!preservesSavedChanges(baseline, saved, ctx.chat)) throw new Error('복구 도중 서버의 채팅 내용이 바뀌어 저장을 멈췄어요. 다른 기기의 답장을 덮어쓰지 않았어요. 원래 채팅을 다시 열어 확인해 주세요.');
+            trace('save_retry', record);
+            await retrySave(record.identity, structuredClone(ctx.chat), stillCurrent);
+            saved = await diskChat(record);
+            if (!stillCurrent()) return false;
+        }
+        if (!matchesSnapshot(saved)) throw new Error('복구한 답장의 저장 내용이 화면과 일치하는지 확인하지 못했어요. 응답을 유지하고 다시 확인합니다.');
         return stillCurrent();
     }
-    async function apply(record, reply, finishedAt) {
+    async function apply(record, reply, finishedAt, postprocess) {
         trace('apply_started', record);
         let ctx = getContext();
-        if (generating || needsReview(record) || record.jobs && !unchanged(record)
+        if (generating || needsReview(record) && !postprocess || record.jobs && !unchanged(record)
             || !sameChat(chatIdentity(ctx), record.identity)) return false;
         const saved = await diskChat(record);
         // A new generation/chat switch can happen while the disk read is pending.
         if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
             || !sameChat(chatIdentity(getContext()), record.identity)) return false;
-        if (position(record, saved)?.done) { await acknowledge(record); return true; }
+        if (position(record, saved)?.done && !record.postprocessPending && !postprocess) { await acknowledge(record); return true; }
         const text = await formatReply(reply.text);
         if (!text.trim()) throw new Error('답장 정리 후 복구할 본문이 없습니다.');
         const latestSaved = await diskChat(record);
@@ -789,10 +853,10 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         if (generating || stopped || !isVisible() || record.jobs && !unchanged(record)
             || !sameChat(chatIdentity(ctx), record.identity)) return false;
         if (!sameSavedValue(latestSaved, saved)) {
-            if (position(record, latestSaved)?.done) { await acknowledge(record); return false; }
+            if (position(record, latestSaved)?.done && !record.postprocessPending && !postprocess) { await acknowledge(record); return false; }
             throw new Error('복구 준비 중 서버의 채팅 내용이 바뀌어 자동 복구를 멈췄어요. 원래 채팅을 다시 열어 확인해 주세요.');
         }
-        if (exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
+        if (!record.postprocessPending && !postprocess && exactSavedReply(record, saved, text) && exactSavedReply(record, ctx.chat, text)) {
             // Already durable AND visible. Release only this response, with no
             // chat write, replayed hooks or misleading recovery success toast.
             reportVisibleReply(record);
@@ -823,16 +887,23 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             if (typeof context.updateMessageBlock === 'function') context.updateMessageBlock(target.index, currentMessage);
             else context.addOneMessage(currentMessage, { type: 'swipe' });
         };
+        let hookBaseline;
+        const previousMessage = chat[target.index];
+        let provisional = false;
         processing.add(record.id);
         try {
-            if (!target.done) {
+            if (!target.done || postprocess) {
+                record = { ...record, postprocessPending: true,
+                    ...(postprocess && !record.reviewBase && saved[record.count]
+                        ? { reviewBase: fingerprint([saved[record.count]]) } : {}) };
+                change(record.id, record);
                 const message = { name: record.name, is_user: false, is_system: false,
                     send_date: new Date(finishedAt || Date.now()).toISOString(), mes: text,
                     gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
                     extra: { api: 'openai', model: record.model,
                         ...(record.translation ? { silly_relay_translation: record.translation } : {}),
                         reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
-                        reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
+                        reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: !postprocess, recovered: true,
                             ...(record.reviewIncomplete ? { reviewIncomplete: true } : {}),
                             ...(record.revision ? { revision: record.revision } : {}) } },
                     swipe_id: 0, swipes: [text] };
@@ -856,7 +927,17 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 ctx.chat[target.index] = message;
                 currentMessage = message;
                 currentSwipe = message.swipe_id ?? 0;
-                ctx.addOneMessage(message, replacing ? { type: 'swipe' } : {});
+                // A resumed semantic review sees the real slot, but its draft
+                // is not rendered or saved as a final answer before it finishes.
+                if (postprocess) {
+                    provisional = true;
+                    await postprocess(target.index, message);
+                    if (!stillCurrent()) return false;
+                    record = list().find(item => item.id === record.id);
+                    if (!record || needsReview(record)) throw new Error('답장 검수를 마치지 못해 복구를 보류했어요. 서버의 답장은 유지합니다.');
+                }
+                provisional = false;
+                ctx.addOneMessage(currentMessage, replacing ? { type: 'swipe' } : {});
                 trace('display_applied', record, { chars: message.mes.length });
                 // The complete reply is now visible. Cancel only its bound main
                 // retry before slow saves. Do not replay translation/review hooks;
@@ -868,7 +949,16 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 if (!stillCurrent()) return false;
                 if (!sameCompletedReply(record, chat, durable)) throw new Error('복구한 답장의 저장 내용이 화면과 일치하는지 확인하지 못했어요. 응답을 유지하고 다시 확인합니다.');
                 trace('durable_verified', record);
-                if (stillCurrent()) {
+                hookBaseline = durable;
+            } else {
+                // Save retries must still run the receive hooks that never ran
+                // after an earlier swallowed save failure.
+                reportVisibleReply(record);
+                if (!await saveCurrent(record, saved, stillCurrent)) return false;
+                hookBaseline = await diskChat(record);
+            }
+            if (record.postprocessPending && stillCurrent()) {
+                if (currentMessage.extra?.[MARK]?.postprocessed !== true) {
                     let displayed = displayState();
                     const syncDisplay = () => {
                         if (!stillCurrent()) return;
@@ -890,13 +980,31 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         }
                     } catch { trace('recovery_failed', record, { reason: 'hook_error' }); warn(record, '답장은 복구했지만 후처리 확장에서 오류가 났습니다.'); }
                     finally { syncDisplay(); trace('hooks_finished', record, { chars: currentMessage?.mes?.length }); }
-                    if (!stillCurrent() || !await saveCurrent(record, durable, stillCurrent)) return false;
+                    if (!stillCurrent()) return false;
+                    record = list().find(item => item.id === record.id) || record;
+                    if (needsReview(record)) return false;
+                    currentMessage.extra[MARK].postprocessed = true;
+                    if (currentMessage.swipe_info?.[currentSwipe]?.extra?.[MARK]) {
+                        currentMessage.swipe_info[currentSwipe].extra[MARK].postprocessed = true;
+                    }
                 }
-            } else {
-                // A previous save failed but the in-memory restored message is still present.
-                reportVisibleReply(record);
-                if (!await saveCurrent(record, saved, stillCurrent)) return false;
+                if (!stillCurrent() || !await saveCurrent(record, hookBaseline, stillCurrent)) return false;
+                const finalSaved = await diskChat(record);
+                if (!stillCurrent() || finalSaved[record.count]?.extra?.[MARK]?.postprocessed !== true) return false;
+                record = { ...record, postprocessPending: false };
+                change(record.id, record);
+                live.delete(record.id);
             }
+        } catch (error) {
+            if (provisional && stillCurrent()) {
+                if (previousMessage) chat[target.index] = previousMessage;
+                else chat.pop();
+                if (previousMessage) getContext().updateMessageBlock?.(target.index, previousMessage);
+            }
+            // Distinguish our own journal checkpoints from a different page's
+            // edits when reporting a save failure to the recovery caller.
+            try { error.recoveryRecord = record; } catch { /* Non-extensible error. */ }
+            throw error;
         } finally { processing.delete(record.id); scheduleReceipt(record.id); }
         if (await acknowledge(record)) notify(record.reviewIncomplete
             ? '검수 미완료 답장을 직접 복구했어요. 검수를 통과한 답장이라는 뜻은 아니에요.'
@@ -921,13 +1029,42 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                     trace('record_skipped', record, { reason: live.has(record.id) ? 'live' : 'other_chat' }); continue;
                 }
                 foundPending ||= needsReview(record);
-                if (needsReview(record) && !allowUnreviewed && pendingReviews.get(record.id) === JSON.stringify(record)) { trace('record_skipped', record, { reason: 'already_prompted' }); continue; }
+                if (needsReview(record) && record.resumeReview !== 1 && !allowUnreviewed && pendingReviews.get(record.id) === JSON.stringify(record)) { trace('record_skipped', record, { reason: 'already_prompted' }); continue; }
                 let expected = record;
                 try {
-                    const data = await readLatest(record);
+                    let data = await readLatest(record);
                     if (!data) continue;
                     if (record.jobs && !unchanged(record)) continue;
-                    if (needsReview(record)) {
+                    // Only explicit, versioned reviewer snapshots may resume.
+                    // Legacy/unknown candidates retain the manual acceptance path.
+                    for (let step = 0; step < 2 && !(manual && allowUnreviewed)
+                        && needsReview(data.record) && data.record.resumeReview === 1; step++) {
+                        // Byte/translation metadata comes from the server read;
+                        // bind that exact candidate before issuing a capability.
+                        change(record.id, data.record);
+                        let context;
+                        try { context = await api(`/jobs/${sourceId(data.record)}/recovery`, { headers: getHeaders() }); }
+                        catch { throw new Error('검수 복구 정보를 읽지 못했어요. 릴레이 서버 플러그인 업데이트와 연결 상태를 확인해 주세요. 서버의 답장은 유지합니다.'); }
+                        if (generating || stopped || !isVisible() || !unchanged(data.record)
+                            || !sameChat(chatIdentity(getContext()), data.record.identity)) { data = null; break; }
+                        let checkpoint = [context.current, context.after].find(item => item?.owner === data.record.reviewOwner);
+                        if (!checkpoint) break;
+                        checkpoint = { ...checkpoint, checkpoint: { ...checkpoint.checkpoint,
+                            attempt: Math.max(checkpoint.checkpoint.attempt || 0, data.record.reviewAttempt || 0) } };
+                        trace('review_resuming', data.record);
+                        const result = await resumeReview({ ...data, context, checkpoint });
+                        if (!result) break;
+                        if (result.postprocess) { data.postprocess = result.postprocess; break; }
+                        const current = list().find(item => item.id === record.id);
+                        if (!current || generating || stopped || !isVisible()
+                            || !sameChat(chatIdentity(getContext()), current.identity)) { data = null; break; }
+                        data = await readLatest(current);
+                        if (current.jobs && !unchanged(current)) { data = null; break; }
+                        if (!data) break;
+                    }
+                    if (!data) continue;
+                    expected = data.record;
+                    if (needsReview(data.record) && !data.postprocess) {
                         trace('review_pending', record);
                         const message = '검수 미완료 답장이 남아 있어 자동 복구를 보류했어요. 설정의 「검수 미완료 답장 직접 복구」에서 확인할 수 있어요. 서버의 임시 보관 기간 안에 확인해 주세요.';
                         pendingReviews.set(record.id, JSON.stringify(record));
@@ -939,12 +1076,13 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         if (generating || stopped || !isVisible() || !unchanged(record)
                             || !sameChat(chatIdentity(getContext()), record.identity)) continue;
                         data.record = { ...data.record, selectedId: sourceId(data.record),
-                            finalized: true, reviewing: false, reviewIncomplete: true };
+                            finalized: true, reviewing: false, reviewIncomplete: true, reviewOwner: null, afterReviewOwner: null };
                     }
                     if (record.jobs) { change(record.id, data.record); expected = data.record; }
-                    const applied = await apply(data.record, data.reply, data.finishedAt);
+                    const applied = await apply(data.record, data.reply, data.finishedAt, data.postprocess);
                     trace('apply_finished', data.record, { applied });
                 } catch (error) {
+                    expected = error.recoveryRecord || expected;
                     trace('recovery_failed', record, { reason: recoveryReason(error), httpStatus: error.httpStatus });
                     if (record.jobs && !unchanged(expected)) continue;
                     if ([404, 410].includes(error.httpStatus)) {
@@ -1048,5 +1186,5 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         for (const state of quickReceipts.values()) clearTimeout(state.timer);
         quickReceipts.clear();
     }
-    return { beginSequence, beginReview, acceptReview, completeReview, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
+    return { expectReview, resumeSequence, beginSequence, beginReview, acceptReview, completeReview, completeSequence, cancelSequence, prepare, event, tag, generationStarted, dataReady, settingsReady, generationEnded, generationStopped, recover, recoverPreviousSession, settle, stop, list };
 }
