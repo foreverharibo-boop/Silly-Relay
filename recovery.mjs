@@ -679,7 +679,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const joined = new Uint8Array(cursor);
         let offset = 0;
         for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
-        record = { ...record, bytes: cursor };
+        record = { ...record, bytes: cursor, translation: state.translation || null };
         if (!record.jobs) change(record.id, record);
         return { record, raw: new TextDecoder().decode(joined), finishedAt: state.finishedAt };
     }
@@ -830,6 +830,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                     send_date: new Date(finishedAt || Date.now()).toISOString(), mes: text,
                     gen_started: new Date(record.created).toISOString(), gen_finished: new Date(finishedAt || Date.now()).toISOString(),
                     extra: { api: 'openai', model: record.model,
+                        ...(record.translation ? { silly_relay_translation: record.translation } : {}),
                         reasoning: ctx.chatCompletionSettings?.show_thoughts === true ? reply.reasoning || '' : '',
                         reasoning_signature: reply.signature, [MARK]: { id: record.id, complete: true, recovered: true,
                             ...(record.reviewIncomplete ? { reviewIncomplete: true } : {}),

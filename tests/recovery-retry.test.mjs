@@ -239,3 +239,14 @@ test('a prompt preview must not let recovery run during a real in-flight generat
     assert.equal(h.ctx.chat.length,1,'the old buffered response must not race the new request');
     assert.ok(traces.some(row=>row.stage==='recovery_blocked'&&row.reason==='generating'));
 });
+
+test('recovery saves translation ticket with the exact reply before receive hooks run', async t => {
+    const binding={id:'b'.repeat(32),variant:'verba',config:'123abc'};
+    const raw=Buffer.from(JSON.stringify({choices:[{message:{content:TEXT}}]}));
+    const h=fixture(t,{api:async path=>path==='/status'?{reloadRecovery:true,owner:'owner'}:path.endsWith('/ack')?{}:{id:ID,state:'completed',status:200,bytes:raw.length,cursor:0,next:raw.length,data:raw.toString('base64'),finishedAt:Date.now(),translation:binding}});
+    let seen=false;
+    h.ctx.eventSource.emit=async name=>{if(name==='received'){assert.deepEqual(h.ctx.chat[1].extra.silly_relay_translation,binding);seen=true;}};
+    await h.prepare();await h.recovery.recover();
+    assert.equal(seen,true);assert.equal(h.ctx.chat[1].mes,TEXT);
+    assert.deepEqual(h.ctx.chat[1].swipe_info[0].extra.silly_relay_translation,binding);
+});

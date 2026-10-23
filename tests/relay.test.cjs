@@ -2072,3 +2072,47 @@ test('optional Verba observer receives one completed reply without owning delive
     await f.start(jobId, { duration: 10, testReply: 'Hello from background.', __verba_server_ticket: ticket });
     assert.equal(seen.length, 1, 'duplicate start does not repeat translation');
 });
+
+test('account notification choice persists; all markers installed route to one target without changing model or prompt', async t => {
+    const { createRouting } = require('../server/notification-routing.cjs');
+    const directory = await fs.mkdtemp(pathModule.join(os.tmpdir(), 'relay-routing-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const routing = createRouting(directory);
+    const f = await fixture(t, { routing });
+    const markers = { silly_pop: { protocol:1, requestId:'apk', clientId:'client' }, silly_pop_ios: { v:1 }, silly_pop_and:{v:1} };
+    for (const target of ['ios','and','apk','none','legacy']) {
+        const saved = await f.request('/notification-settings', { method:'POST', body:JSON.stringify({target,owner:'bob'}) });
+        assert.equal(saved.status,200);
+        assert.equal(createRouting(directory).get('alice'),target);
+        assert.equal(createRouting(directory).get('bob'),'legacy','body cannot change another account');
+        const payload = { ...markers, model:'gemini-4-argon', vertexai_region:'global', messages:[{role:'user',content:'unchanged'}], duration:1 };
+        const jobId = id(); await f.start(jobId,payload); await delay(30);
+        const call = f.calls.at(-1);
+        assert.equal(call.body.model,payload.model); assert.deepEqual(call.body.messages,payload.messages);
+        for (const [kind,field] of [['apk','silly_pop'],['ios','silly_pop_ios'],['and','silly_pop_and']])
+            assert.equal(!!call.body[field],target==='legacy'||target===kind);
+        assert.equal((await f.get(jobId)).notificationTarget,target);
+        routing.set('alice',target==='ios'?'and':'ios');
+        await f.start(jobId,payload);
+        assert.equal((await f.get(jobId)).notificationTarget,target,'acceptance retry keeps its original choice');
+    }
+    assert.equal(f.calls.length,5,'lost acceptance must not repeat AI requests');
+    const bad = await f.request('/notification-settings',{method:'POST',body:JSON.stringify({target:'unknown'})});
+    assert.equal(bad.status,400);
+});
+
+test('selected iOS route strips APK header and returns owner-bound translation ticket for recovery',async t=>{
+    const symbol=Symbol.for('verba.relay-observer'), previous=globalThis[symbol];
+    const ticket=id(),binding={id:ticket,variant:'verba',config:'abc123'};
+    globalThis[symbol]={apiVersion:1,complete(){},notificationTarget(owner,value){assert.equal(owner,'alice');assert.equal(value,ticket);return 'ios';},binding:()=>binding,translationNotification:()=>true};
+    t.after(()=>{if(previous)globalThis[symbol]=previous;else delete globalThis[symbol];});
+    const f=await fixture(t,{routing:{get:()=> 'and'}}),job=id();
+    await f.request('/jobs',{method:'POST',headers:{'x-silly-pop':'old-apk-marker'},body:JSON.stringify({id:job,path:PATH,body:JSON.stringify({model:'custom',silly_pop:{enabled:true},silly_pop_ios:{v:1},silly_pop_and:{v:1},__verba_server_ticket:ticket,duration:1})})});
+    await delay(30);
+    assert.equal(f.calls[0].headers['x-silly-pop'],undefined);
+    assert.equal(f.calls[0].body.silly_pop,undefined);
+    assert.equal(f.calls[0].body.silly_pop_ios.translationPending,true);
+    assert.equal(f.calls[0].body.__verba_server_ticket,undefined);
+    assert.deepEqual((await f.get(job)).translation,binding);
+    const other=await f.request(`/jobs/${job}`,{headers:{cookie:'user=bob'}});assert.equal(other.status,404);
+});

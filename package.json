@@ -1,9 +1,11 @@
 {
   "name": "silly-relay",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "private": true,
   "description": "Resumable generation transport for SillyTavern",
   "main": "server/index.cjs",
   "license": "AGPL-3.0-or-later",
-  "scripts": { "test": "node --test tests/*.test.cjs tests/*.test.mjs" }
+  "scripts": {
+    "test": "node --test tests/*.test.cjs tests/*.test.mjs"
+  }
 }

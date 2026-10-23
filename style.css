@@ -3,3 +3,6 @@
 #silly-relay-settings .sr-actions { display: flex; gap: 6px; margin: 8px 0; }
 #silly-relay-settings .menu_button { width: auto; padding: 4px 8px; margin: 0; font-size: .85em; }
 #silly-relay-settings .sr-actions[hidden] { display: none; }
+
+#silly-relay-settings .sr-notification-target { display: flex; flex-direction: column; gap: 6px; margin: 12px 0 6px; }
+#silly-relay-settings .sr-notification-target select { width: 100%; min-width: 0; }

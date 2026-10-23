@@ -1,10 +1,10 @@
-import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.18';
-import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.18';
-import { createTransport } from './transport.mjs?v=1.0.18';
-import { createRecovery } from './recovery.mjs?v=1.0.18';
-import { recoveryIdentity } from './identity.mjs?v=1.0.18';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.18';
-import { createReplySessions } from './reply-session.mjs?v=1.0.18';
+import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.19';
+import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.19';
+import { createTransport } from './transport.mjs?v=1.0.19';
+import { createRecovery } from './recovery.mjs?v=1.0.19';
+import { recoveryIdentity } from './identity.mjs?v=1.0.19';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.19';
+import { createReplySessions } from './reply-session.mjs?v=1.0.19';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -16,6 +16,8 @@ let state = '연결 확인을 눌러 주세요.';
 let lastEvent = '아직 생성 요청이 없습니다.';
 let lastRecoveryEvent = '';
 let checking = false;
+let notificationTarget = 'legacy';
+let notificationRevision = 0;
 let recovery;
 let diagnostics;
 const replies = createReplyFilter();
@@ -74,11 +76,13 @@ async function check() {
     if (checking) return;
     checking = true;
     try {
+        const revision = notificationRevision;
         const result = await transport.api('/status', { headers: headers() });
         diagnostics?.bind(result.owner);
+        if (result.notificationRouting && revision === notificationRevision) { notificationTarget = result.notificationTarget; panel.querySelector('[data-pop-target]').value = notificationTarget; }
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.18 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.19 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -143,6 +147,13 @@ function initialize() {
         <div class="inline-drawer-content">
             <label class="checkbox_label"><input type="checkbox"><span>연결 유지</span></label>
             <small>이 브라우저에서만 적용합니다. 서버로 전달된 생성 요청을 유지합니다.</small>
+            <label class="sr-notification-target">완료 알림 연결 <select class="text_pole" data-pop-target>
+                <option value="legacy">선택 전 · 기존 실리팝 설정 유지</option>
+                <option value="none">사용 안 함</option><option value="apk">실리팝 APK</option>
+                <option value="ios">실리팝 iOS</option><option value="and">실리팝 AND</option>
+            </select></label>
+            <small>같은 실리태번 계정에서 공통으로 사용합니다. 변경은 다음 요청부터 적용합니다. 알림 받을 기기와 알림 켜기는 해당 실리팝에서 설정해 주세요.</small>
+            <p data-pop-status role="status"></p>
             <p data-status></p><small data-last></small>
             <p data-recovery hidden></p>
             <div class="sr-actions"><button class="menu_button" data-diagnostics>서버·복구 진단 내려받기</button></div>
@@ -163,6 +174,17 @@ function initialize() {
         else { replies.clear(); state = '새 요청부터 연결 유지 기능을 사용하지 않습니다.'; update(); }
     });
     panel.querySelector('[data-check]').addEventListener('click', check);
+    panel.querySelector('[data-pop-target]').addEventListener('change', async event => {
+        const select = event.currentTarget;
+        notificationRevision++;
+        select.disabled = true;
+        try {
+            const result = await transport.api('/notification-settings', { method: 'POST', headers: headers(), body: JSON.stringify({ target: select.value }) });
+            notificationTarget = result.target; select.value = result.target;
+            panel.querySelector('[data-pop-status]').textContent = '계정 공통 설정을 저장했습니다. 다음 요청부터 적용합니다.';
+        } catch (error) { select.value = notificationTarget; panel.querySelector('[data-pop-status]').textContent = '저장 실패: ' + error.message; }
+        finally { select.disabled = false; }
+    });
     panel.querySelector('[data-diagnostics]').addEventListener('click', async event => {
         const button = event.currentTarget; button.disabled = true;
         try {
@@ -194,6 +216,8 @@ function initialize() {
     });
     function resume() {
         transport.resume();
+        const revision = notificationRevision;
+        if (active) void transport.api('/notification-settings', { headers: headers() }).then(result => { if (revision !== notificationRevision) return; notificationTarget = result.target; panel.querySelector('[data-pop-target]').value = notificationTarget; }).catch(() => {});
         void flushCancellations();
         if (active && tabId) void recovery.recover();
     }

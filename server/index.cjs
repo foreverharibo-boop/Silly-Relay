@@ -1,12 +1,13 @@
 'use strict';
 
 const http = require('node:http');
+const { createRouting, filterMarkers } = require('./notification-routing.cjs');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
 const { createJournal, errorDetails } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.6';
+const VERSION = '1.0.7';
 // Optional observer: existing reply transport/recovery owns generation unchanged.
 globalThis[Symbol.for('verba.relay-capability')] = 1;
 const PATHS = new Set([
@@ -54,6 +55,7 @@ function createRelay(overrides = {}) {
     // Keep self-requests local without changing ST's global AI routing/filter.
     const internalAgent = new http.Agent({ keepAlive: false });
     const journal = overrides.journal;
+    const routing = overrides.routing || createRouting();
     const trace = (owner, stage, id, data) => { try { journal?.record(owner, stage, id, data); } catch { /* Logging never controls delivery. */ } };
     const jobs = new Map();
     let totalBytes = 0;
@@ -114,7 +116,8 @@ function createRelay(overrides = {}) {
     }
     function describe(job) {
         return { id: job.id, state: job.state, createdAt: job.createdAt, finishedAt: job.finishedAt,
-            status: job.status, contentType: job.contentType, bytes: job.size, error: job.error };
+            status: job.status, contentType: job.contentType, bytes: job.size, error: job.error, notificationTarget: job.notificationTarget,
+            translation: job.translationBinding || null };
     }
     function slice(job, from, to) {
         const buffers = [];
@@ -145,7 +148,8 @@ function createRelay(overrides = {}) {
         const cleanPayload = JSON.parse(body);
         const translationTicket = ID.test(cleanPayload.__verba_server_ticket || '') ? cleanPayload.__verba_server_ticket : null;
         delete cleanPayload.__verba_server_ticket;
-        const upstreamBody = translationTicket ? JSON.stringify(cleanPayload) : body;
+        // Resolve once after duplicate detection: retries keep the original route.
+        let upstreamBody;
         prune();
         const digest = createHash('sha256').update(path).update('\0').update(body).digest('hex');
         const existing = jobs.get(keyOf(owner, id));
@@ -154,6 +158,23 @@ function createRelay(overrides = {}) {
             trace(owner, 'duplicate_start', id, { bytes: existing.size, status: existing.status });
             return existing; // A lost start response must not cause a second AI request.
         }
+        let notificationTarget;
+        try { notificationTarget = routing.get(owner); } catch { notificationTarget = 'none'; }
+        if (translationTicket) {
+            try { notificationTarget = globalThis[Symbol.for('verba.relay-observer')]?.notificationTarget?.(owner, translationTicket) ?? notificationTarget; } catch {}
+        }
+        const routedPayload = filterMarkers(cleanPayload, notificationTarget);
+        let translationBinding = null;
+        if (translationTicket) {
+            try {
+                const observer = globalThis[Symbol.for('verba.relay-observer')];
+                translationBinding = observer?.binding?.(owner, translationTicket) || null;
+                const field = notificationTarget === 'ios' ? 'silly_pop_ios' : notificationTarget === 'and' ? 'silly_pop_and' : null;
+                if (field && routedPayload[field] && observer?.translationNotification?.(owner, translationTicket))
+                    routedPayload[field] = { ...routedPayload[field], translationPending: true };
+            } catch { /* Original reply remains deliverable when translation is unavailable. */ }
+        }
+        upstreamBody = translationTicket || notificationTarget !== 'legacy' ? JSON.stringify(routedPayload) : body;
         // Use the actual accepted server socket, never a URL or port supplied by a client.
         // This prototype supports HTTP ST servers, including HTTPS terminated by a reverse proxy.
         if (req.socket.encrypted) throw fail(409, 'Silly Relay는 실리태번 자체 HTTPS 모드를 지원하지 않습니다.');
@@ -175,13 +196,14 @@ function createRelay(overrides = {}) {
         const job = { owner, id, digest, state: 'running', chunks: [], size: 0,
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
             events: new EventEmitter(), upstream: null, timer: null,
-            translationTicket };
+            translationTicket, notificationTarget, translationBinding };
         jobs.set(keyOf(owner, id), job);
         trace(owner, 'accepted', id);
         const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(upstreamBody),
             'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
         // Authenticate the internal HTTP request through ST's own middleware again.
         for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-silly-pop', 'accept', 'host']) {
+            if (name === 'x-silly-pop' && !['legacy', 'apk'].includes(notificationTarget)) continue;
             if (typeof req.headers[name] === 'string') headers[name] = req.headers[name];
         }
         job.diagnostic = { phase: 'setup', requestFinished: false };
@@ -254,9 +276,11 @@ function createRelay(overrides = {}) {
                 trace(req.user?.profile?.handle, 'api_error', req.params?.id || req.body?.id, { status: error.status || 500 });
                 return res.status(error.status || 500).json({ error: error.status ? error.message : '서버 처리 오류입니다.' }); }
         };
+        router.get('/notification-settings', wrap((req, res) => res.json({ target: routing.get(ownerOf(req)) })));
+        router.post('/notification-settings', wrap((req, res) => res.json({ target: routing.set(ownerOf(req), req.body?.target) })));
         router.get('/status', wrap((req, res) => {
             const owner = ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, translationObserver: true, diagnosticJournal: !!journal, owner });
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, translationObserver: true, notificationRouting: true, notificationTarget: routing.get(owner), diagnosticJournal: !!journal, owner });
         }));
         router.get('/diagnostics', wrap(async (req, res) => {
             const owner = ownerOf(req);
@@ -334,7 +358,9 @@ function createRelay(overrides = {}) {
 let relay;
 const info = { id: 'silly-relay', name: 'Silly Relay', description: 'Experimental server-owned, resumable AI requests' };
 async function init(router) {
-    relay = createRelay({ journal: createJournal({ directory: path.join(__dirname, '..', 'diagnostic-data') }) });
+    const routing = createRouting(path.join(__dirname, '..', 'notification-data'));
+    globalThis[Symbol.for('silly-relay.notification-routing.v1')] = routing;
+    relay = createRelay({ routing, journal: createJournal({ directory: path.join(__dirname, '..', 'diagnostic-data') }) });
     relay.install(router);
     console.log(`[Silly Relay] ${VERSION} loaded`);
 }
