@@ -2033,3 +2033,42 @@ test('authenticated export connects server lifecycle events and cannot request a
     assert.equal(other.events.length, 0);
     assert.equal((await f.request('/diagnostics', { headers: { cookie: '' } })).status, 401);
 });
+
+test('installed relay leaves ordinary Vertex requests untouched; explicit relay preserves their model', async t => {
+    const f = await fixture(t);
+    const payload = { model: 'gemini-4-argon', chat_completion_source: 'vertexai',
+        vertexai_region: 'global', vertexai_express_project_id: 'fixture-project',
+        messages: [{ role: 'user', content: 'fixture' }], duration: 5 };
+    const direct = await fetch(f.base + PATH, { method: 'POST', headers: AUTH, body: JSON.stringify(payload) });
+    assert.equal(direct.status, 200);
+    await direct.text();
+    assert.deepEqual(f.calls[0].body, payload);
+    assert.equal(f.calls[0].headers['user-agent'].startsWith('Silly-Relay/'), false);
+    for (const ticket of [null, id()]) {
+        const jobId = id();
+        await f.start(jobId, { ...payload, ...(ticket ? { __verba_server_ticket: ticket } : {}) });
+        await delay(40);
+        assert.equal((await f.get(jobId)).state, 'completed');
+        assert.deepEqual(f.calls.at(-1).body, payload);
+    }
+});
+
+test('optional Verba observer receives one completed reply without owning delivery', async t => {
+    const symbol = Symbol.for('verba.relay-observer');
+    const before = globalThis[symbol];
+    t.after(() => { if (before) globalThis[symbol] = before; else delete globalThis[symbol]; });
+    const seen = [];
+    globalThis[symbol] = { apiVersion: 1, complete(owner, ticket, reply) { seen.push({owner,ticket,reply}); } };
+    const f = await fixture(t);
+    const ticket = id(); const jobId = id();
+    await f.start(jobId, { duration: 10, testReply: 'Hello from background.', __verba_server_ticket: ticket });
+    await delay(70);
+    const result = await f.get(jobId);
+    assert.equal(result.state, 'completed');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].owner, 'alice');assert.equal(seen[0].ticket, ticket);
+    assert.match(seen[0].reply.body.toString(), /Hello from background/);
+    assert.equal(f.calls.length, 1);
+    await f.start(jobId, { duration: 10, testReply: 'Hello from background.', __verba_server_ticket: ticket });
+    assert.equal(seen.length, 1, 'duplicate start does not repeat translation');
+});

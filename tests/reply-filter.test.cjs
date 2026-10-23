@@ -47,7 +47,7 @@ test('quiet, impersonation, dry runs and unknown requests bypass; nested helper 
     const prompt = [{ role: 'user', content: 'reply' }];
     const main = { messages: prompt };
     filter.generationStarted(); filter.dataReady({ prompt }); filter.settingsReady(main);
-    for (const [type, options, dryRun] of [['quiet', {}, false], ['impersonate', {}, false], [undefined, {}, true], ['normal', { quietToLoud: true }, false]]) {
+    for (const [type, options, dryRun] of [['quiet', {}, false], ['impersonate', {}, false], ['normal', { quietToLoud: true }, false]]) {
         filter.generationStarted(type, options, dryRun);
         filter.dataReady({ prompt });
         assert.equal(filter.settingsReady({ messages: prompt, type }), false);
@@ -57,6 +57,12 @@ test('quiet, impersonation, dry runs and unknown requests bypass; nested helper 
     assert.equal(take(filter, main), true);
     filter.clear();
     assert.equal(take(filter, main), false);
+    // Unlike real nested generations, previews do not emit ENDED or send a
+    // SETTINGS_READY request. A standalone preview must arm nothing.
+    filter.generationStarted('normal', {}, true);
+    filter.dataReady({ prompt }, true);
+    assert.equal(filter.settingsReady({ messages: prompt, type: 'normal' }), false);
+    assert.equal(take(filter, { messages: prompt, type: 'normal' }), false);
 });
 
 test('text generation uses its final data event and excludes quiet requests', async () => {
@@ -114,4 +120,14 @@ test('observing native payload before a cooperating extension clones messages pr
     const sent = clone(payload); delete sent.__ttotto_main_request;
     assert.equal(take(filter, sent), true);
     assert.equal(take(filter, sent), false);
+});
+
+test('native dry runs without end events do not hide a bound main reply', async () => {
+    const {createReplyFilter}=await import('../reply-filter.mjs');
+    const filter=createReplyFilter();const prompt=[{role:'user',content:'main reply'}];
+    filter.generationStarted('normal');filter.dataReady({prompt});
+    const payload={type:'normal',messages:prompt};assert.equal(filter.settingsReady(payload),true);
+    filter.generationStarted('normal',{},true);filter.dataReady({prompt:[{role:'user',content:'preview'}]},true);
+    assert.equal(take(filter,payload),true);
+    filter.generationEnded();assert.equal(take(filter,payload),false);
 });

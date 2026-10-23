@@ -6,7 +6,9 @@ const { EventEmitter } = require('node:events');
 
 const { createJournal, errorDetails } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.5';
+const VERSION = '1.0.6';
+// Optional observer: existing reply transport/recovery owns generation unchanged.
+globalThis[Symbol.for('verba.relay-capability')] = 1;
 const PATHS = new Set([
     '/api/backends/chat-completions/generate',
     '/api/backends/text-completions/generate',
@@ -84,6 +86,17 @@ function createRelay(overrides = {}) {
         job.events.emit('change');
         trace(job.owner, state, job.id, { ...job.diagnostic, ...details,
             elapsedMs: Math.max(0, job.finishedAt - job.createdAt), status: job.status, bytes: job.size });
+        if (job.translationTicket) {
+            try {
+                const observer = globalThis[Symbol.for('verba.relay-observer')];
+                if (observer?.apiVersion === 1) {
+                    Promise.resolve(observer.complete(job.owner, job.translationTicket, {
+                        state, status: job.status, type: job.contentType,
+                        body: state === 'completed' ? slice(job, 0, job.size) : Buffer.alloc(0),
+                    })).catch(() => {});
+                }
+            } catch { /* Optional translation never changes reply delivery. */ }
+        }
         // Metadata only. Never log the body, character names, cookies or keys.
         console.log(`[Silly Relay] ${job.id.slice(0, 8)} ${state} (HTTP ${job.status || 'pending'}, ${job.size} bytes)`);
     }
@@ -129,6 +142,10 @@ function createRelay(overrides = {}) {
             const parsed = JSON.parse(body);
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
         } catch { throw fail(400, '생성 요청 본문은 JSON 객체여야 합니다.'); }
+        const cleanPayload = JSON.parse(body);
+        const translationTicket = ID.test(cleanPayload.__verba_server_ticket || '') ? cleanPayload.__verba_server_ticket : null;
+        delete cleanPayload.__verba_server_ticket;
+        const upstreamBody = translationTicket ? JSON.stringify(cleanPayload) : body;
         prune();
         const digest = createHash('sha256').update(path).update('\0').update(body).digest('hex');
         const existing = jobs.get(keyOf(owner, id));
@@ -157,10 +174,11 @@ function createRelay(overrides = {}) {
         }
         const job = { owner, id, digest, state: 'running', chunks: [], size: 0,
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
-            events: new EventEmitter(), upstream: null, timer: null };
+            events: new EventEmitter(), upstream: null, timer: null,
+            translationTicket };
         jobs.set(keyOf(owner, id), job);
         trace(owner, 'accepted', id);
-        const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
+        const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(upstreamBody),
             'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
         // Authenticate the internal HTTP request through ST's own middleware again.
         for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-silly-pop', 'accept', 'host']) {
@@ -221,7 +239,7 @@ function createRelay(overrides = {}) {
                 upstream.destroy();
             }, limits.timeoutMs);
             job.timer.unref?.();
-            upstream.end(body);
+            upstream.end(upstreamBody);
         } catch (error) {
             finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.', { reason: 'request_setup_error', ...errorDetails(error) });
             upstream?.destroy();
@@ -238,7 +256,7 @@ function createRelay(overrides = {}) {
         };
         router.get('/status', wrap((req, res) => {
             const owner = ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, diagnosticJournal: !!journal, owner });
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, translationObserver: true, diagnosticJournal: !!journal, owner });
         }));
         router.get('/diagnostics', wrap(async (req, res) => {
             const owner = ownerOf(req);
@@ -284,7 +302,8 @@ function createRelay(overrides = {}) {
                 }
                 job = { owner, id, digest: null, state: 'running', chunks: [], size: 0,
                     createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
-                    events: new EventEmitter(), upstream: null, timer: null };
+                    events: new EventEmitter(), upstream: null, timer: null,
+                    translationTicket: null };
                 jobs.set(keyOf(owner, id), job);
             }
             cancel(job);

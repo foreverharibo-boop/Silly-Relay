@@ -424,6 +424,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         for (const record of list()) scheduleReceipt(record.id);
     }
     function generationStarted(type, options = {}, dryRun = false) {
+        // ST prompt previews return without GENERATION_ENDED. They must not
+        // suspend a real generation or leave its parent state stranded later.
+        if (dryRun) return;
         generationParents.push({ ticket, generating });
         generating = !dryRun;
         ticket = !dryRun && !options.quietToLoud && [undefined, 'normal', 'regenerate', 'swipe'].includes(type)

@@ -213,3 +213,29 @@ test('stopping recovery cancels scheduled receipt checks', async t => {
     await new Promise(resolve => setTimeout(resolve, 650));
     assert.equal(reads, before);
 });
+
+test('a prompt preview cannot leave recovery stuck generating after the actual request ends', async t => {
+    const traces=[];
+    const h=fixture(t,{trace:(stage,data)=>traces.push({stage,...data})});
+    h.recovery.generationStarted('normal');h.recovery.dataReady({},false);
+    assert.equal(await h.recovery.prepare({id:ID,path:PATH,body:'{"type":"normal"}'}),true);
+    // Native ST dry runs do not emit GENERATION_ENDED. They may run while a
+    // real request is awaiting its response, e.g. a prompt-token preview.
+    h.recovery.generationStarted('normal',{},true);h.recovery.dataReady({},true);
+    // An interrupted browser delivery leaves the completed response on server.
+    h.recovery.event('error',{id:ID});h.recovery.generationEnded();
+    await h.recovery.recover();
+    assert.equal(h.ctx.chat[1]?.mes,TEXT);
+    assert.equal(traces.some(row=>row.stage==='recovery_blocked'&&row.reason==='generating'),false);
+});
+
+test('a prompt preview must not let recovery run during a real in-flight generation', async t => {
+    const traces=[];
+    const h=fixture(t,{trace:(stage,data)=>traces.push({stage,...data})});
+    await h.prepare();
+    h.recovery.generationStarted('normal');
+    h.recovery.generationStarted('normal',{},true);h.recovery.dataReady({},true);
+    await h.recovery.recover();
+    assert.equal(h.ctx.chat.length,1,'the old buffered response must not race the new request');
+    assert.ok(traces.some(row=>row.stage==='recovery_blocked'&&row.reason==='generating'));
+});
