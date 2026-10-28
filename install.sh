@@ -34,9 +34,9 @@ if [[ -e "$plugin_dest" || -L "$plugin_dest" || -e "$extension_dest" || -L "$ext
 fi
 mkdir -p -- "$st_root/plugins"
 mkdir -- "$plugin_dest" "$extension_dest"
-cp -- "$relay_source/package.json" "$relay_source/LICENSE" "$plugin_dest/"
+cp -- "$relay_source/package.json" "$relay_source/LICENSE" "$relay_source/NOTICE" "$plugin_dest/"
 cp -R -- "$relay_source/server" "$plugin_dest/server"
-for relay_file in manifest.json index.js transport.mjs recovery.mjs identity.mjs diagnostics.mjs recovery-reasons.mjs reply-filter.mjs reply-session.mjs style.css LICENSE; do
+for relay_file in manifest.json index.js transport.mjs recovery.mjs identity.mjs diagnostics.mjs recovery-reasons.mjs reply-filter.mjs reply-session.mjs style.css LICENSE NOTICE; do
     cp -- "$relay_source/$relay_file" "$extension_dest/"
 done
 echo "Silly Relay 서버 1.0.8 / 웹 확장 1.0.20 설치 완료"
