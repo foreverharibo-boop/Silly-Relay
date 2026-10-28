@@ -4,7 +4,7 @@
   "private": true,
   "description": "Resumable generation transport for SillyTavern",
   "main": "server/index.cjs",
-  "license": "AGPL-3.0-or-later",
+  "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "test": "node --test tests/*.test.cjs tests/*.test.mjs"
   }
