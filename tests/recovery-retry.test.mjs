@@ -276,3 +276,45 @@ test('recovery saves translation ticket with the exact reply before receive hook
     assert.equal(seen,true);assert.equal(h.ctx.chat[1].mes,TEXT);
     assert.deepEqual(h.ctx.chat[1].swipe_info[0].extra.silly_relay_translation,binding);
 });
+
+test('conflicting old request pauses across reload without reads or repeated warnings; manual retry keeps guards', async t => {
+    let reads = 0, diskReads = 0;
+    const h = fixture(t); const api = h.settings.api, fetchImpl = h.settings.fetchImpl;
+    h.settings.api = (...args) => { if (args[0] !== '/status') reads++; return api(...args); };
+    h.settings.fetchImpl = (...args) => { diskReads++; return fetchImpl(...args); };
+    await h.prepare(); h.recovery.stop();
+    const conflict = [{ ...USER, mes: 'User changed the history' }];
+    h.setDisk(conflict); h.ctx.chat = structuredClone(conflict);
+    let page = createRecovery(h.settings); t.after(() => page.stop());
+    await page.recover();
+    assert.equal(page.list()[0].autoRecoveryPaused.reason, 'guard_14');
+    const notes = h.notes.length, readsBefore = reads, diskBefore = diskReads;
+    await page.recover(); page.stop();
+    page = createRecovery(h.settings); t.after(() => page.stop());
+    await page.recover(); await page.settle();
+    assert.equal(reads, readsBefore); assert.equal(diskReads, diskBefore);
+    assert.equal(h.notes.length, notes); assert.deepEqual(h.ctx.chat, conflict);
+    await page.recover({ manual: true });
+    assert.equal(page.list()[0].autoRecoveryPaused.reason, 'guard_14');
+    assert.deepEqual(h.ctx.chat, conflict);
+    h.ctx.chat = [structuredClone(USER)]; h.setDisk([USER]);
+    await page.recover(); assert.equal(h.ctx.chat.length, 1, 'only an explicit retry releases the pause');
+    await page.recover({ manual: true });
+    assert.equal(h.ctx.chat[1].mes, TEXT); assert.equal(page.list().length, 0);
+});
+
+test('a paused old request does not prevent a newer reply in the same chat being recovered', async t => {
+    const h = fixture(t); await h.prepare();
+    const another = { name: 'Character', is_user: false, mes: 'Different saved answer' };
+    h.ctx.chat.push(another); h.setDisk(h.ctx.chat);
+    await h.recovery.recover(); assert.ok(h.recovery.list()[0].autoRecoveryPaused);
+    h.ctx.chat.push({ ...USER, mes: 'Next turn' }); h.setDisk(h.ctx.chat);
+    const nextId = 'b'.repeat(32);
+    h.recovery.generationStarted('normal'); h.recovery.dataReady({}, false);
+    await h.recovery.prepare({ id: nextId, path: PATH, body: '{"type":"normal"}' });
+    h.recovery.event('error', { id: nextId }); h.recovery.generationEnded();
+    await h.recovery.recover();
+    assert.equal(h.ctx.chat[3].mes, TEXT);
+    assert.equal(h.recovery.list().length, 1); assert.equal(h.recovery.list()[0].id, ID);
+    assert.deepEqual(h.ctx.chat[1], another);
+});

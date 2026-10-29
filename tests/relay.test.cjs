@@ -2313,3 +2313,131 @@ test('selected iOS route strips APK header and returns owner-bound translation t
     assert.deepEqual((await f.get(job)).translation,binding);
     const other=await f.request(`/jobs/${job}`,{headers:{cookie:'user=bob'}});assert.equal(other.status,404);
 });
+
+test('early-returning 100LOG review waits for its actual completion after ttotto handoff', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    await recoverableReview(old, f, true); old.recovery.stop();
+    let page, finish, began;
+    const started = new Promise(resolve => { began = resolve; });
+    const trace = [], owners = [];
+    page = await b.makePage('same-tab', {
+        trace: (stage, detail) => trace.push({ stage, ...detail }),
+        resumeReview: async data => {
+            owners.push(data.checkpoint.owner);
+            if (data.checkpoint.owner === 'ttotto') {
+                page.recovery.completeSequence(page.recovery.resumeSequence(data.record, data.context), data.record.jobId);
+                return { resumed: true };
+            }
+            return { postprocess: async (index, message) => {
+                const sequence = page.recovery.beginReview(index, message, new AbortController().signal,
+                    { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+                assert.ok(sequence);
+                assert.equal(page.recovery.beginReview(index, message, new AbortController().signal,
+                    { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true }), null);
+                finish = () => page.recovery.completeReview(sequence, message);
+                began(); // The extension returns while its own callback is still working.
+            } };
+        },
+    });
+    const pending = page.recovery.recover(); await started; await delay(20);
+    await page.recovery.recover();
+    assert.equal(b.disk.messages.length, 1); assert.equal(b.rendered.length, 0);
+    assert.ok(trace.some(e => e.stage === 'review_waiting'));
+    assert.ok(!trace.some(e => e.stage === 'recovery_failed'));
+    finish(); await pending;
+    assert.deepEqual(owners, ['ttotto', 'hundredlog']);
+    assert.equal(b.disk.messages[1].mes, 'Retained draft'); assert.equal(page.recovery.list().length, 0);
+    assert.equal(f.calls.length, 1);
+    assert.ok(!b.messages.some(m => /검수를 마치지/.test(m)));
+});
+
+for (const interruption of ['reload', 'abort']) test(`waiting review ${interruption} retains the reply and rejects a late old completion`, async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    const original = await recoverableReview(old, f, true); old.recovery.stop();
+    let page, finish, began;
+    const controller = new AbortController();
+    const started = new Promise(resolve => { began = resolve; });
+    const resumeReview = async data => {
+        if (data.checkpoint.owner === 'ttotto') {
+            page.recovery.completeSequence(page.recovery.resumeSequence(data.record, data.context), data.record.jobId);
+            return { resumed: true };
+        }
+        return { postprocess: async (index, message) => {
+            const review = page.recovery.beginReview(index, message, controller.signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            assert.ok(review); finish = () => page.recovery.completeReview(review, message); began();
+        } };
+    };
+    page = await b.makePage('same-tab', { resumeReview });
+    const pending = page.recovery.recover(); await started; await delay(10);
+    if (interruption === 'reload') page.recovery.stop(); else controller.abort();
+    await pending; finish();
+    assert.equal(b.disk.messages.length, 1); assert.equal(page.ctx.chat.length, 1);
+    assert.equal(page.recovery.list().length, 1);
+    assert.equal((await f.request(`/jobs/${original.jobId}`)).status, 200);
+    page.recovery.stop();
+    page = await b.makePage('same-tab', { resumeReview: async data => {
+        assert.equal(data.checkpoint.owner, 'hundredlog', 'do not repeat completed ttotto');
+        return { postprocess: async (index, message) => {
+            const review = page.recovery.beginReview(index, message, new AbortController().signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            assert.ok(review); page.recovery.completeReview(review, message);
+        } };
+    } });
+    await page.recovery.recover();
+    assert.equal(b.disk.messages[1].mes, 'Retained draft'); assert.equal(page.recovery.list().length, 0);
+    assert.equal(f.calls.length, 1);
+});
+
+test('transport reviewer returning early waits before handing the reply to 100LOG', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    await recoverableReview(old, f, true); old.recovery.stop();
+    let page, finish, began;
+    const started = new Promise(resolve => { began = resolve; }); const owners = [];
+    page = await b.makePage('same-tab', { resumeReview: async data => {
+        owners.push(data.checkpoint.owner);
+        if (data.checkpoint.owner === 'ttotto') {
+            const sequence = page.recovery.resumeSequence(data.record, data.context);
+            finish = () => page.recovery.completeSequence(sequence, data.record.jobId);
+            began(); return { resumed: true };
+        }
+        return { postprocess: async (index, message) => {
+            const sequence = page.recovery.beginReview(index, message, new AbortController().signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            page.recovery.completeReview(sequence, message);
+        } };
+    } });
+    const pending = page.recovery.recover(); await started; await delay(20);
+    assert.deepEqual(owners, ['ttotto']); assert.equal(b.rendered.length, 0);
+    finish(); await pending;
+    assert.deepEqual(owners, ['ttotto', 'hundredlog']);
+    assert.equal(page.recovery.list().length, 0); assert.equal(f.calls.length, 1);
+});
+
+test('hiding during an active review preserves the checkpoint and restores only the remaining review on return', async t => {
+    const f = await fixture(t), b = await recoveryBrowser(t, f), old = await b.makePage();
+    await recoverableReview(old, f, true); old.recovery.stop();
+    let page, visible = true, began, finishOld, first = true;
+    const started = new Promise(resolve => { began = resolve; }); const owners = [];
+    page = await b.makePage('same-tab', { isVisible: () => visible, resumeReview: async data => {
+        owners.push(data.checkpoint.owner);
+        if (data.checkpoint.owner === 'ttotto') {
+            page.recovery.completeSequence(page.recovery.resumeSequence(data.record, data.context), data.record.jobId);
+            return { resumed: true };
+        }
+        return { postprocess: async (index, message) => {
+            const sequence = page.recovery.beginReview(index, message, new AbortController().signal,
+                { owner: 'hundredlog', checkpoint: data.checkpoint.checkpoint, resuming: true });
+            if (first) { first = false; finishOld = () => page.recovery.completeReview(sequence, message); began(); }
+            else page.recovery.completeReview(sequence, message);
+        } };
+    } });
+    const pending = page.recovery.recover(); await started; await delay(20); visible = false; await pending;
+    assert.equal(page.ctx.chat.length, 1); assert.equal(b.disk.messages.length, 1);
+    visible = true; finishOld();
+    assert.ok(page.recovery.list()[0].reviewOwner);
+    await page.recovery.recover();
+    assert.deepEqual(owners, ['ttotto', 'hundredlog', 'hundredlog']);
+    assert.equal(page.recovery.list().length, 0); assert.equal(f.calls.length, 1);
+    assert.ok(!b.messages.some(m => /검수를 마치지/.test(m)));
+});

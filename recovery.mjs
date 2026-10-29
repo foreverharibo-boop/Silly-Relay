@@ -1,4 +1,4 @@
-import { recoveryReason } from './recovery-reasons.mjs?v=1.0.20';
+import { recoveryReason } from './recovery-reasons.mjs?v=1.0.21';
 // Reload recovery: pending request IDs and chat fingerprints only; no response archive.
 export const MARK = 'silly_relay';
 const VALID_ID = /^[a-f0-9]{32}$/;
@@ -182,6 +182,42 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     const quickReceipts = new Map();
     const processing = new Set();
     const sequences = new WeakSet();
+    // Actual capabilities in this page, not persisted "reviewing" flags. A
+    // reload may resume a checkpoint, but must never wait on a dead page's task.
+    const reviewRuns = new Map();
+    function trackReview(sequence, record) {
+        let finish;
+        const done = new Promise(resolve => { finish = resolve; });
+        const abort = () => cancelSequence(sequence);
+        reviewRuns.set(record.id, { sequence, revision: record.revision, done, finish, abort });
+        sequence.signal?.addEventListener('abort', abort, { once: true });
+    }
+    function finishReview(sequence) {
+        const run = reviewRuns.get(sequence.id);
+        if (run?.sequence !== sequence) return;
+        reviewRuns.delete(sequence.id);
+        sequence.signal?.removeEventListener('abort', run.abort);
+        run.finish();
+    }
+    async function waitForReview(id, valid) {
+        let observed;
+        while (reviewRuns.has(id)) {
+            const run = reviewRuns.get(id);
+            const record = list().find(item => item.id === id);
+            if (!record || !valid() || run.sequence.signal?.aborted) {
+                cancelSequence(run.sequence);
+                trace('review_wait_interrupted', record, { reason: 'context_changed' });
+                return false;
+            }
+            if (run !== observed) { trace('review_waiting', record); observed = run; }
+            // Completion wakes immediately; the timer only checks page/chat
+            // changes and the existing retention deadline, never calls the AI.
+            let timer;
+            try { await Promise.race([run.done, new Promise(resolve => { timer = setTimeout(resolve, 250); })]); }
+            finally { clearTimeout(timer); }
+        }
+        return valid();
+    }
     // Volatile capabilities, not journal data. After a page reload the old
     // 429die timers are gone too; never attach an old recovery to a new request.
     const replyReceipts = new Map();
@@ -382,7 +418,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return true;
     }
     async function receipt(record) {
-        if (needsReview(record) || record.postprocessPending || processing.has(record.id)) return false;
+        if (record.autoRecoveryPaused || needsReview(record) || record.postprocessPending || processing.has(record.id)) return false;
         if (stopped || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return false;
         // An actual read-back, not saveChat()'s return value: ST can swallow save errors.
         const saved = await diskChat(record);
@@ -409,7 +445,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     function scheduleReceipt(id) {
         const record = list().find(r => r.id === id);
-        if (stopped || !record || needsReview(record) || processing.has(id)
+        if (stopped || !record || record.autoRecoveryPaused || needsReview(record) || processing.has(id)
             || !isVisible() || !sameChat(chatIdentity(getContext()), record.identity)) return;
         const state = quickReceipts.get(id) || { attempts: 0, timer: null };
         if (state.timer || state.attempts >= 6) return;
@@ -464,13 +500,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         return sequence;
     }
     function resumeSequence(record, context) {
-        if (generating || !unchanged(record) || !sameChat(record.identity, chatIdentity(getContext()))
+        if (reviewRuns.has(record.id) || generating || !unchanged(record) || !sameChat(record.identity, chatIdentity(getContext()))
             || stopped || !isVisible()) return null;
         const sequence = { id: record.id, closed: false, resuming: true,
             ticket: { armed: true, type: isSwipe(record) ? 'swipe' : 'normal', identity: record.identity },
             recovery: structuredClone(context) };
         delete sequence.recovery.body;
         sequences.add(sequence);
+        trackReview(sequence, record);
         return sequence;
     }
     function beginReview(index, message, signal, options = {}) {
@@ -491,6 +528,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         });
         if (candidates.length !== 1) return null;
         const original = candidates[0];
+        if (reviewRuns.has(original.id)) return null;
         const jobs = original.jobs || [{ id: original.id, stream: original.stream, mainApi: original.mainApi,
             source: original.source, includeReasoning: original.includeReasoning, model: original.model, bytes: original.bytes }];
         const selectedId = original.selectedId || sourceId(original);
@@ -508,6 +546,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         sequence.resuming = !!options.resuming;
         if (current) sequence.recovery = { version: 1, current };
         sequences.add(sequence);
+        trackReview(sequence, record);
         trace('review_started', record);
         message.extra ||= {};
         message.extra[MARK] = { id: record.id, complete: false, revision: record.revision };
@@ -531,7 +570,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         const selected = message.mes === sequence.acceptedText ? sequence.acceptedId
             : message.mes === sequence.baseText ? sequence.baseId : null;
         if (!selected) { cancelSequence(sequence); return; }
-        completeSequence(sequence, selected);
+        if (!completeSequence(sequence, selected)) return;
         live.add(record.id);
         tag(record.count, true);
         if (sequence.resuming) live.delete(record.id);
@@ -539,9 +578,12 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     function completeSequence(sequence, selectedId) {
         if (!sequences.has(sequence) || sequence.closed) return;
-        sequence.closed = true;
         const record = list().find(r => r.id === sequence.id);
-        if (!record) return;
+        const run = reviewRuns.get(sequence.id);
+        if (!record || run && (run.sequence !== sequence || run.revision !== record.revision)) {
+            sequence.closed = true; finishReview(sequence); return false;
+        }
+        sequence.closed = true;
         const selected = record.jobs.find(job => job.id === selectedId);
         if (selected) change(record.id, { ...record, ...selected, id: record.id,
             jobId: selected.id, jobs: record.jobs, selectedId, finalized: true, reviewing: false, reviewIncomplete: false,
@@ -550,12 +592,15 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         // No selected response means an interrupted review. Keep candidates
         // for explicit recovery, without treating body completion as approval.
         else live.delete(record.id);
-        trace('review_finalized', record, { selectedId, applied: !!selected });
+        finishReview(sequence);
+        trace('review_finalized', list().find(item => item.id === record.id) || record, { selectedId, applied: !!selected });
         if (sequence.resuming) live.delete(record.id);
+        return !!selected;
     }
     function cancelSequence(sequence) {
-        if (!sequences.has(sequence)) return;
+        if (!sequences.has(sequence) || sequence.closed) return;
         sequence.closed = true;
+        finishReview(sequence);
         if (sequence.id) { if (!sequence.resuming) change(sequence.id, null); live.delete(sequence.id); }
     }
     async function prepare(request) {
@@ -932,6 +977,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 if (postprocess) {
                     provisional = true;
                     await postprocess(target.index, message);
+                    if (!await waitForReview(record.id, stillCurrent)) return false;
                     if (!stillCurrent()) return false;
                     record = list().find(item => item.id === record.id);
                     if (!record || needsReview(record)) throw new Error('답장 검수를 마치지 못해 복구를 보류했어요. 서버의 답장은 유지합니다.');
@@ -996,6 +1042,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 live.delete(record.id);
             }
         } catch (error) {
+            const run = reviewRuns.get(record.id);
+            if (run?.sequence.resuming) cancelSequence(run.sequence);
             if (provisional && stillCurrent()) {
                 if (previousMessage) chat[target.index] = previousMessage;
                 else chat.pop();
@@ -1005,7 +1053,14 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
             // edits when reporting a save failure to the recovery caller.
             try { error.recoveryRecord = record; } catch { /* Non-extensible error. */ }
             throw error;
-        } finally { processing.delete(record.id); scheduleReceipt(record.id); }
+        } finally {
+            if (provisional && getContext().chat === chat && chat.length === expectedLength
+                && chat[target.index] === currentMessage && (currentMessage?.swipe_id ?? 0) === currentSwipe) {
+                if (previousMessage) chat[target.index] = previousMessage;
+                else chat.pop();
+            }
+            processing.delete(record.id); scheduleReceipt(record.id);
+        }
         if (await acknowledge(record)) notify(record.reviewIncomplete
             ? '검수 미완료 답장을 직접 복구했어요. 검수를 통과한 답장이라는 뜻은 아니에요.'
             : '다시 접속하기 전에 받던 답장을 원래 채팅에 복구했어요.', true);
@@ -1021,12 +1076,24 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
         try {
             await identify();
             trace('recovery_started', null, { manual, allowUnreviewed });
+            if (manual) for (const record of list()) {
+                if (!record.autoRecoveryPaused || live.has(record.id)
+                    || !sameChat(chatIdentity(getContext()), record.identity)) continue;
+                const { autoRecoveryPaused, ...retry } = record;
+                change(record.id, retry);
+                trace('recovery_retry_requested', retry);
+            }
             await settle();
             let foundPending = false;
             for (const record of list()) {
                 trace('record_considered', record);
                 if (live.has(record.id) || !sameChat(chatIdentity(getContext()), record.identity)) {
                     trace('record_skipped', record, { reason: live.has(record.id) ? 'live' : 'other_chat' }); continue;
+                }
+                if (record.autoRecoveryPaused) {
+                    trace('record_skipped', record, { reason: 'automatic_paused' });
+                    diagnostic(`이전 요청 ${record.id.slice(0, 8)}의 자동 복구를 보류했어요. 「보류한 답장 복구 다시 확인」에서 재시도할 수 있어요. 서버의 임시 보관 기한이 적용돼요.`);
+                    continue;
                 }
                 foundPending ||= needsReview(record);
                 if (needsReview(record) && record.resumeReview !== 1 && !allowUnreviewed && pendingReviews.get(record.id) === JSON.stringify(record)) { trace('record_skipped', record, { reason: 'already_prompted' }); continue; }
@@ -1055,6 +1122,8 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         const result = await resumeReview({ ...data, context, checkpoint });
                         if (!result) break;
                         if (result.postprocess) { data.postprocess = result.postprocess; break; }
+                        if (!await waitForReview(record.id, () => !generating && !stopped && isVisible()
+                            && sameChat(chatIdentity(getContext()), record.identity))) { data = null; break; }
                         const current = list().find(item => item.id === record.id);
                         if (!current || generating || stopped || !isVisible()
                             || !sameChat(chatIdentity(getContext()), current.identity)) { data = null; break; }
@@ -1084,7 +1153,18 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 } catch (error) {
                     expected = error.recoveryRecord || expected;
                     trace('recovery_failed', record, { reason: recoveryReason(error), httpStatus: error.httpStatus });
+                    const activeReview = reviewRuns.get(record.id);
+                    if (activeReview?.sequence.resuming) cancelSequence(activeReview.sequence);
                     if (record.jobs && !unchanged(expected)) continue;
+                    if (['guard_14', 'guard_15', 'guard_16'].includes(recoveryReason(error))) {
+                        if (!unchanged(expected)) continue;
+                        change(record.id, { ...expected, autoRecoveryPaused: { reason: recoveryReason(error) } });
+                        clearTimeout(quickReceipts.get(record.id)?.timer); quickReceipts.delete(record.id);
+                        trace('recovery_paused', expected, { reason: recoveryReason(error) });
+                        const message = `이전 요청 ${record.id.slice(0, 8)}은 현재 채팅과 맞지 않아 자동 복구를 보류했어요. 기존 메시지는 변경하지 않았어요. 「보류한 답장 복구 다시 확인」에서 재시도할 수 있어요.`;
+                        diagnostic(message); warn(record, message);
+                        continue;
+                    }
                     if ([404, 410].includes(error.httpStatus)) {
                         // Another page/receipt may have ACKed while this read was
                         // in flight. A saved reply is not a missing reply.
@@ -1183,6 +1263,9 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
     }
     function stop() {
         stopped = true;
+        for (const run of [...reviewRuns.values()]) {
+            run.sequence.closed = true; finishReview(run.sequence);
+        }
         for (const state of quickReceipts.values()) clearTimeout(state.timer);
         quickReceipts.clear();
     }
