@@ -1,4 +1,4 @@
-import { recoveryReason } from './recovery-reasons.mjs?v=1.0.21';
+import { recoveryReason } from './recovery-reasons.mjs?v=1.0.22';
 // Reload recovery: pending request IDs and chat fingerprints only; no response archive.
 export const MARK = 'silly_relay';
 const VALID_ID = /^[a-f0-9]{32}$/;
@@ -1092,7 +1092,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                 }
                 if (record.autoRecoveryPaused) {
                     trace('record_skipped', record, { reason: 'automatic_paused' });
-                    diagnostic(`이전 요청 ${record.id.slice(0, 8)}의 자동 복구를 보류했어요. 「보류한 답장 복구 다시 확인」에서 재시도할 수 있어요. 서버의 임시 보관 기한이 적용돼요.`);
+                    diagnostic(`이전 요청 ${record.id.slice(0, 8)}의 자동 복구를 보류했어요. 「답장 복구 확인」에서 재시도할 수 있어요. 서버의 임시 보관 기한이 적용돼요.`);
                     continue;
                 }
                 foundPending ||= needsReview(record);
@@ -1161,7 +1161,7 @@ export function createRecovery({ getContext, api, fetchImpl, getHeaders, storage
                         change(record.id, { ...expected, autoRecoveryPaused: { reason: recoveryReason(error) } });
                         clearTimeout(quickReceipts.get(record.id)?.timer); quickReceipts.delete(record.id);
                         trace('recovery_paused', expected, { reason: recoveryReason(error) });
-                        const message = `이전 요청 ${record.id.slice(0, 8)}은 현재 채팅과 맞지 않아 자동 복구를 보류했어요. 기존 메시지는 변경하지 않았어요. 「보류한 답장 복구 다시 확인」에서 재시도할 수 있어요.`;
+                        const message = `이전 요청 ${record.id.slice(0, 8)}은 현재 채팅과 맞지 않아 자동 복구를 보류했어요. 기존 메시지는 변경하지 않았어요. 「답장 복구 확인」에서 재시도할 수 있어요.`;
                         diagnostic(message); warn(record, message);
                         continue;
                     }

@@ -1,10 +1,10 @@
-import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.21';
-import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.21';
-import { createTransport } from './transport.mjs?v=1.0.21';
-import { createRecovery } from './recovery.mjs?v=1.0.21';
-import { recoveryIdentity } from './identity.mjs?v=1.0.21';
-import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.21';
-import { createReplySessions } from './reply-session.mjs?v=1.0.21';
+import { createDiagnostics, collectDiagnostics } from './diagnostics.mjs?v=1.0.22';
+import { RECOVERY_REASONS } from './recovery-reasons.mjs?v=1.0.22';
+import { createTransport } from './transport.mjs?v=1.0.22';
+import { createRecovery } from './recovery.mjs?v=1.0.22';
+import { recoveryIdentity } from './identity.mjs?v=1.0.22';
+import { createReplyFilter, createWarningGate } from './reply-filter.mjs?v=1.0.22';
+import { createReplySessions } from './reply-session.mjs?v=1.0.22';
 
 const ENABLE_KEY = 'silly-relay-enabled-v1';
 const CANCEL_KEY = 'silly-relay-pending-cancel-v1';
@@ -83,7 +83,7 @@ async function check() {
         if (result.notificationRouting && revision === notificationRevision) { notificationTarget = result.notificationTarget; panel.querySelector('[data-pop-target]').value = notificationTarget; }
         if (result.protocol !== 2 || !result.ready) throw new Error('이 서버 설정에서는 Silly Relay를 사용할 수 없습니다.');
         if (!result.reloadRecovery) throw new Error('서버 플러그인도 업데이트한 뒤 서버를 재시작해 주세요.');
-        state = `확장 1.0.21 · 서버 ${result.version} 연결됨`;
+        state = `확장 1.0.22 · 서버 ${result.version} 연결됨`;
         if (globalThis.fetch !== hook) state += ' · 다른 확장의 요청 처리와 함께 설치되어 있습니다';
         await flushCancellations();
         if (active) void recovery.recover();
@@ -186,8 +186,7 @@ function initialize() {
             <div class="sr-actions"><button class="menu_button" data-diagnostics>서버·복구 진단 내려받기</button></div>
             <small>본문·API 키 없이 처리 기록을 자동 보관합니다. 서버 기록은 서버 재시작 후에도 남으며 오래된 기록부터 교체합니다. 서버 플러그인 1.0.3 이상이 필요합니다.</small>
             <div class="sr-actions"><button class="menu_button" data-check>연결 확인</button></div>
-            <div class="sr-actions" data-previous-panel hidden><button class="menu_button" data-previous>답장 복구 확인</button></div>
-            <div class="sr-actions"><button class="menu_button" data-retry-recovery>보류한 답장 복구 다시 확인</button></div>
+            <div class="sr-actions"><button class="menu_button" data-previous>답장 복구 확인</button></div>
             <div class="sr-actions"><button class="menu_button" data-unreviewed>검수 미완료 답장 직접 복구</button></div>
             <small>검수에서 최종 선택한 답장은 자동 복구합니다. 검수가 중단된 후보는 위 버튼에서 확인한 뒤 직접 복구할 수 있어요. 서버의 기존 임시 보관 기한이 적용돼요.</small>
             <small>다른 앱으로 이동해도 서버 요청을 유지합니다. 새로고침하거나 홈 화면 웹앱을 다시 실행한 뒤 같은 채팅을 열면 일반 답장을 자동 복구합니다. 1:1 Chat Completion의 일반 답변·재생성·스와이프를 복구합니다. 스와이프는 기존 후보를 유지하며 새 후보 하나를 복구합니다. 계속쓰기·그룹 채팅은 아직 복구 대상이 아닙니다.</small>
@@ -225,14 +224,6 @@ function initialize() {
         finally { button.disabled = false; }
     });
     document.addEventListener('visibilitychange', () => diagnostics.record(document.hidden ? 'page_hidden' : 'page_visible'));
-    panel.querySelector('[data-retry-recovery]').addEventListener('click', async event => {
-        if (!active) { notify('연결 유지를 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
-        const button = event.currentTarget;
-        button.disabled = true;
-        try { await recovery.recover({ manual: true }); }
-        catch (error) { notify(error.message); }
-        finally { button.disabled = false; }
-    });
     panel.querySelector('[data-unreviewed]').addEventListener('click', async event => {
         if (!active) { notify('연결 유지를 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
         const button = event.currentTarget;
@@ -241,12 +232,14 @@ function initialize() {
         catch (error) { notify(error.message); }
         finally { button.disabled = false; }
     });
-    panel.querySelector('[data-previous-panel]').hidden = !standalone;
     panel.querySelector('[data-previous]').addEventListener('click', async event => {
-        if (!active) { notify('연결 유지을 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
+        if (!active) { notify('연결 유지를 켠 뒤 원래 채팅에서 눌러 주세요.'); return; }
         const button = event.currentTarget;
         button.disabled = true;
-        try { await recovery.recoverPreviousSession(); }
+        try {
+            if (standalone) await recovery.recoverPreviousSession();
+            else await recovery.recover({ manual: true });
+        }
         catch (error) { notify(error.message); }
         finally { button.disabled = false; }
     });

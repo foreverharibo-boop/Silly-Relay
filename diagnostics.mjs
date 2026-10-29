@@ -65,7 +65,7 @@ export async function collectDiagnostics({ api, headers, diagnostics, reasons = 
             ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}) };
     }
     const browser = diagnostics.report();
-    return { extension: 'Silly Relay', version: '1.0.21', exportedAt: new Date().toISOString(),
+    return { extension: 'Silly Relay', version: '1.0.22', exportedAt: new Date().toISOString(),
         serverVersion: typeof status?.version === 'string' && /^[0-9.\w-]{1,40}$/.test(status.version) ? status.version : null,
         note: 'Server read means a response was sent, not that the browser displayed or saved it. Browser events describe only this browser. Times use each device clock. No reply bodies, prompts, keys or character/chat names are included. Prior events may be absent due to rotation, limits or storage failures. Push notification delivery is not observed by Relay.',
         reasons, server, browser,
