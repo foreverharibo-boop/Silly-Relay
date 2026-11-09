@@ -6,6 +6,7 @@ const memory = () => { const map = new Map(); return { getItem: key => map.get(k
 test('browser trace persists reloads, bounds history, strips private data and separates accounts', () => {
     const storage = memory(), diag = createDiagnostics({ storage, limit: 4 }); diag.bind('alice');
     for (let i = 0; i < 6; i++) diag.record('candidate_selected', { id: ID, chars: i, text: 'PRIVATE_BODY', message: 'PRIVATE_ERROR', reason: 'PRIVATE_REASON' });
+    diag.flush();
     const reloaded = createDiagnostics({ storage, limit: 4 }); reloaded.bind('alice');
     assert.equal(reloaded.report().events.length, 4); assert.ok(reloaded.report().dropped > 0);
     assert.ok(reloaded.report().events.some(e => e.id === ID));
@@ -36,4 +37,13 @@ test('old or offline server still exports browser records with a clear missing-s
         assert.equal(r.server.unavailable, true); assert.ok(r.browser.events.some(e => e.id === ID));
         assert.doesNotMatch(JSON.stringify(r), /PRIVATE_SERVER_ERROR/);
     }
+});
+
+test('diagnostic bursts batch writes, account switching and export flush without changing events',()=>{
+ let writes=0;const map=new Map(),storage={getItem:k=>map.get(k),setItem:(k,v)=>{writes++;map.set(k,v);}};
+ const d=createDiagnostics({storage});d.bind('alice');for(let i=0;i<100;i++)d.record('starting',{id:ID});
+ assert.equal(writes,0);d.flush();assert.equal(writes,1);d.flush();assert.equal(writes,1);
+ d.record('completed',{id:ID});d.bind('bob');assert.equal(writes,2);
+ assert.equal(JSON.parse(map.get('silly-relay-diagnostics-v1:alice')).rows.at(-1).stage,'completed');
+ assert.equal(d.report().events.length,1);assert.equal(writes,3);d.dispose();
 });

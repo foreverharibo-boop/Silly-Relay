@@ -22,16 +22,26 @@ function sanitize(stage, data = {}) {
     return row;
 }
 export function createDiagnostics({ storage, limit = 600, now = Date.now } = {}) {
-    let key, rows = [], dropped = 0, storageFailures = 0;
+    let key, rows = [], dropped = 0, storageFailures = 0, timer = null, dirty = false;
     const sessionId = globalThis.crypto?.randomUUID?.() || `${now()}-${Math.random().toString(36).slice(2)}`;
-    function persist() {
-        try { storage?.setItem(key, JSON.stringify({ rows, dropped })); } catch { storageFailures++; }
+    function flush() {
+        if (timer !== null) clearTimeout(timer);
+        timer = null;
+        if (!key || !dirty) return;
+        try { storage?.setItem(key, JSON.stringify({ rows, dropped })); dirty = false; } catch { storageFailures++; }
     }
+    function persist() {
+        dirty = true;
+        if (timer === null) { timer = setTimeout(flush, 250); timer.unref?.(); }
+    }
+    const visibility = () => { if (globalThis.document?.hidden) flush(); };
+    globalThis.addEventListener?.('pagehide', flush);
+    globalThis.document?.addEventListener('visibilitychange', visibility);
     function bind(owner) {
         if (typeof owner !== 'string' || !owner) return;
         const next = `silly-relay-diagnostics-v1:${owner}`;
         if (key === next) return;
-        key = next; rows = []; dropped = 0;
+        flush(); key = next; rows = []; dropped = 0; dirty = false;
         try {
             const stored = JSON.parse(storage?.getItem(key) || '{}');
             for (const item of Array.isArray(stored.rows) ? stored.rows.slice(-limit) : []) {
@@ -49,8 +59,11 @@ export function createDiagnostics({ storage, limit = 600, now = Date.now } = {})
         rows.push({ ...safe, at: now(), sessionId });
         if (rows.length > limit) { dropped += rows.length - limit; rows.splice(0, rows.length - limit); }
         persist();
+        if (globalThis.document?.hidden || stage === 'page_hidden') flush();
     }
-    return { bind, record, report: () => ({ version: 1, limit, dropped, storageFailures, events: rows.map(row => ({ ...row })) }) };
+    return { bind, record, flush,
+        dispose() { flush(); globalThis.removeEventListener?.('pagehide', flush); globalThis.document?.removeEventListener('visibilitychange', visibility); },
+        report() { flush(); return { version: 1, limit, dropped, storageFailures, events: rows.map(row => ({ ...row })) }; } };
 }
 
 export async function collectDiagnostics({ api, headers, diagnostics, reasons = {} }) {
@@ -65,7 +78,7 @@ export async function collectDiagnostics({ api, headers, diagnostics, reasons = 
             ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}) };
     }
     const browser = diagnostics.report();
-    return { extension: 'Silly Relay', version: '1.0.23', exportedAt: new Date().toISOString(),
+    return { extension: 'Silly Relay', version: '1.0.24', exportedAt: new Date().toISOString(),
         serverVersion: typeof status?.version === 'string' && /^[0-9.\w-]{1,40}$/.test(status.version) ? status.version : null,
         note: 'Server read means a response was sent, not that the browser displayed or saved it. Browser events describe only this browser. Times use each device clock. No reply bodies, prompts, keys or character/chat names are included. Prior events may be absent due to rotation, limits or storage failures. Push notification delivery is not observed by Relay.',
         reasons, server, browser,
