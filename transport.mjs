@@ -81,7 +81,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         try { url = new URL(request ? request.url : String(input), origin); }
         catch { return fetchImpl(input, init); }
         const method = String(init?.method ?? request?.method ?? 'GET').toUpperCase();
-        if (!enabled() || method !== 'POST' || url.origin !== new URL(origin).origin || !PATHS.has(url.pathname) || url.search) {
+        if (method !== 'POST' || url.origin !== new URL(origin).origin || !PATHS.has(url.pathname) || url.search) {
             return fetchImpl(input, init);
         }
         let body = init?.body;
@@ -92,6 +92,11 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         let payload;
         try { payload = JSON.parse(body); }
         catch { return fetchImpl(input, init); }
+        const deferred = payload?.__silly_relay_prepare !== undefined;
+        if (!enabled()) {
+            if (deferred) throw new Error('서버 준비 요청은 릴레이 연결 유지가 필요합니다.');
+            return fetchImpl(input, init);
+        }
         let isReply = false;
         try {
             const decision = sequence ? { sequence } : shouldRelay({ path: url.pathname, payload });
@@ -99,7 +104,10 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             isReply = decision === true || !!sequence;
         }
         catch { /* Unknown requests retain the original transport. */ }
-        if (!isReply) return fetchImpl(input, init);
+        if (!isReply) {
+            if (deferred) throw new Error('답장 요청을 확인하지 못해 서버 준비를 중단했습니다.');
+            return fetchImpl(input, init);
+        }
         const link = linkedSignal(init?.signal ?? request?.signal, sequence?.signal);
         const signal = link.signal;
         if (signal?.aborted) { link.dispose(); throw abortError(); }
@@ -107,6 +115,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         headers.set('content-type', 'application/json');
         const credentials = init?.credentials ?? request?.credentials ?? 'same-origin';
         const id = newId();
+        const preparationParent = deferred && sequence && (sequence.latestId || sequence.baseId || sequence.id);
         // Persist the binding BEFORE submitting a billable request. Recoverable replies
         // are acknowledged by the chat layer only after the saved message is verified.
         let retainForRecovery = false;
@@ -117,6 +126,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
             // suppress the one original AI request or retry it by another route.
             emit('recovery-unavailable', { id, message: error.message || '복구 준비 실패' });
         }
+        if (deferred && !retainForRecovery) { link.dispose(); throw new Error('복구 준비에 실패해 서버 준비 요청을 전송하지 않았습니다.'); }
         if (signal?.aborted) { link.dispose(); emit('cancelled', { id }); throw abortError(); }
         let stopped = false;
         let detached = false;
@@ -142,6 +152,7 @@ export function createTransport({ fetchImpl, origin, enabled, onEvent = () => {}
         emit('starting', { id });
         const startedAt = Date.now();
         const envelope = JSON.stringify({ id, path: url.pathname, body,
+            ...(preparationParent ? { preparationParent } : {}),
             ...(retainForRecovery && recoveryRequest.recovery ? { recovery: recoveryRequest.recovery } : {}) });
         let startInfo;
         try {

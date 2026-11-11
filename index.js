@@ -166,6 +166,15 @@ function initialize() {
         recovery, transport, consume: replies.consume, captureQuiet: replies.captureQuiet,
         onError: error => onEvent('recovery-unavailable', { message: error.message || '수정본 복구 기록 실패' }) });
     globalThis.fetch = hook;
+    globalThis.sillyRelayPreparation = Object.freeze({
+        apiVersion: 1,
+        enabled: () => active && !!tabId,
+        async supports(provider) {
+            if (!active || !tabId) return false;
+            const status = await transport.api('/status', { headers: headers() });
+            return active && !!tabId && status.ready && status.preparations?.includes(provider) === true;
+        },
+    });
     panel = document.createElement('div');
     panel.id = 'silly-relay-settings';
     panel.className = 'extension_container';

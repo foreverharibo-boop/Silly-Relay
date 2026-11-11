@@ -7,7 +7,9 @@ const { EventEmitter } = require('node:events');
 
 const { createJournal, errorDetails } = require('./diagnostics.cjs');
 const path = require('node:path');
-const VERSION = '1.0.8';
+const VERSION = '1.0.9';
+const PREPARERS = Symbol.for('silly-relay.preparers.v1');
+const preparers = () => globalThis[PREPARERS] instanceof Map ? globalThis[PREPARERS] : new Map();
 // Optional observer: existing reply transport/recovery owns generation unchanged.
 globalThis[Symbol.for('verba.relay-capability')] = 1;
 const PATHS = new Set([
@@ -61,7 +63,7 @@ function createRelay(overrides = {}) {
     let totalBytes = 0;
     const keyOf = (owner, id) => JSON.stringify([owner, id]);
     function release(job) {
-        if (!job.released) totalBytes -= job.size + (job.recoveryBytes || 0);
+        if (!job.released) totalBytes -= job.size + (job.recoveryBytes || 0) + (job.preparationBytes || 0);
         job.chunks = [];
         job.recovery = null;
         job.released = true;
@@ -84,6 +86,7 @@ function createRelay(overrides = {}) {
         job.error = error;
         job.finishedAt = Date.now();
         clearTimeout(job.timer);
+        job.prepareAbort?.abort();
         job.upstream = null;
         if (state === 'failed' || state === 'cancelled') release(job);
         job.events.emit('change');
@@ -147,6 +150,21 @@ function createRelay(overrides = {}) {
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
         } catch { throw fail(400, '생성 요청 본문은 JSON 객체여야 합니다.'); }
         const cleanPayload = JSON.parse(body);
+        if (req.body.preparationParent !== undefined && !ID.test(String(req.body.preparationParent)))
+            throw fail(400, '재검수 원래 작업 번호가 올바르지 않습니다.');
+        const preparation = cleanPayload.__silly_relay_prepare;
+        delete cleanPayload.__silly_relay_prepare;
+        let preparer;
+        if (preparation !== undefined) {
+            if (path !== '/api/backends/chat-completions/generate'
+                || !preparation || typeof preparation.provider !== 'string'
+                || typeof preparation.ticket !== 'string' || preparation.ticket.length > 80)
+                throw fail(400, '잘못된 서버 준비 요청입니다.');
+            preparer = preparers().get(preparation.provider);
+            if (preparer?.apiVersion !== 1 || typeof preparer.prepare !== 'function')
+                throw fail(409, '선택한 서버 준비 플러그인이 없습니다. 요청을 전송하지 않았습니다.');
+        }
+        const preparationBytes = preparer ? Buffer.byteLength(body) : 0;
         // Review snapshots live only beside the temporary response, under the
         // same account/TTL/memory budget. Never put prompts or keys in journals.
         let recovery = null, recoveryBytes = 0;
@@ -166,12 +184,21 @@ function createRelay(overrides = {}) {
         let upstreamBody;
         prune();
         const digest = createHash('sha256').update(path).update('\0').update(body)
+            .update(req.body.preparationParent || '')
             .update(recovery ? JSON.stringify(req.body.recovery) : '').digest('hex');
         const existing = jobs.get(keyOf(owner, id));
         if (existing) {
             if (existing.digest && existing.digest !== digest) throw fail(409, '같은 작업 번호에 다른 요청이 들어왔습니다.');
             trace(owner, 'duplicate_start', id, { bytes: existing.size, status: existing.status });
             return existing; // A lost start response must not cause a second AI request.
+        }
+        const parentJobId = req.body.preparationParent;
+        if (parentJobId !== undefined) {
+            const parent = typeof parentJobId === 'string' && jobs.get(keyOf(owner, parentJobId));
+            if (!preparer || !parent || parent.state !== 'completed'
+                || parent.preparation?.provider !== preparation.provider
+                || parent.preparation?.ticket !== preparation.ticket)
+                throw fail(409, '완료된 원래 답장을 확인하지 못해 재검수 요청을 중단했습니다.');
         }
         let notificationTarget;
         try { notificationTarget = routing.get(owner); } catch { notificationTarget = 'none'; }
@@ -189,11 +216,14 @@ function createRelay(overrides = {}) {
                     routedPayload[field] = { ...routedPayload[field], translationPending: true };
             } catch { /* Original reply remains deliverable when translation is unavailable. */ }
         }
-        upstreamBody = translationTicket || notificationTarget !== 'legacy' ? JSON.stringify(routedPayload) : body;
+        upstreamBody = preparer || translationTicket || notificationTarget !== 'legacy' ? JSON.stringify(routedPayload) : body;
         // Use the actual accepted server socket, never a URL or port supplied by a client.
         // This prototype supports HTTP ST servers, including HTTPS terminated by a reverse proxy.
         if (req.socket.encrypted) throw fail(409, 'Silly Relay는 실리태번 자체 HTTPS 모드를 지원하지 않습니다.');
         if (!req.socket.localAddress || !req.socket.localPort) throw fail(503, '실리태번 서버 주소를 확인할 수 없습니다.');
+        // Capture while the accepting socket is alive. Preparation may finish
+        // after the browser closes and Node clears that socket's local address.
+        const internalTarget = { hostname: internalAddress(req.socket), port: req.socket.localPort };
         const pending = [...jobs.values()].filter(j => j.state === 'running' || j.state === 'completed');
         const active = pending.filter(j => j.state === 'running');
         const ownPending = pending.filter(j => j.owner === owner).length;
@@ -205,15 +235,17 @@ function createRelay(overrides = {}) {
             throw fail(429, `보관 한도: 이 계정에 전달·저장 확인을 기다리는 요청이 ${ownPending}/${limits.perUserJobs}개 있습니다. 이번 요청은 접수되지 않았습니다.`);
         }
         if (active.length >= limits.active) throw fail(429, '서버 전체 동시 생성 한도입니다. 잠시 뒤 다시 시도해 주세요. 이번 요청은 접수되지 않았습니다.');
-        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || totalBytes + recoveryBytes >= limits.totalBytes) {
+        if (jobs.size >= limits.metadataJobs || pending.length >= limits.jobs || totalBytes + recoveryBytes + preparationBytes >= limits.totalBytes) {
             throw fail(429, '서버 전체 응답 보관 한도입니다. 이번 요청은 접수되지 않았습니다.');
         }
         const job = { owner, id, digest, state: 'running', chunks: [], size: 0,
             createdAt: Date.now(), finishedAt: null, status: 0, contentType: '', error: '',
             events: new EventEmitter(), upstream: null, timer: null,
-            translationTicket, notificationTarget, translationBinding, recovery, recoveryBytes };
+            translationTicket, notificationTarget, translationBinding, recovery, recoveryBytes, preparationBytes,
+            preparation: preparer ? { provider: preparation.provider, ticket: preparation.ticket } : null,
+            prepareAbort: preparer ? new AbortController() : null };
         jobs.set(keyOf(owner, id), job);
-        totalBytes += recoveryBytes;
+        totalBytes += recoveryBytes + preparationBytes;
         trace(owner, 'accepted', id);
         const headers = { 'content-type': 'application/json', 'content-length': Buffer.byteLength(upstreamBody),
             'accept-encoding': 'identity', 'user-agent': `Silly-Relay/${VERSION}`, connection: 'close' };
@@ -224,8 +256,11 @@ function createRelay(overrides = {}) {
         }
         job.diagnostic = { phase: 'setup', requestFinished: false };
         let upstream;
+        function send() {
+        if (job.state !== 'running') return;
+        headers['content-length'] = Buffer.byteLength(upstreamBody);
         try {
-            const address = internalAddress(req.socket);
+            const address = internalTarget.hostname;
             const agentName = http.globalAgent?.constructor?.name;
             Object.assign(job.diagnostic, { phase: 'connecting',
                 targetKind: address === '::1' ? 'loopback_ipv6' : address.startsWith('127.') ? 'loopback_ipv4'
@@ -233,7 +268,7 @@ function createRelay(overrides = {}) {
                 globalAgentKind: agentName === 'PrivateRequestAgent' ? 'private_filter' : agentName === 'ProxyAgent' ? 'proxy'
                     : http.globalAgent?.constructor === http.Agent ? 'native' : 'other' });
             trace(owner, 'upstream_connecting', id, job.diagnostic);
-            upstream = http.request({ hostname: address, port: req.socket.localPort,
+            upstream = http.request({ ...internalTarget,
                 path, method: 'POST', headers, agent: internalAgent }, response => {
                 job.diagnostic.phase = 'headers';
                 job.status = response.statusCode || 502;
@@ -272,15 +307,42 @@ function createRelay(overrides = {}) {
             }));
             upstream.once('finish', () => { job.diagnostic.requestFinished = true; });
             upstream.once('error', error => finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.', { reason: 'connection_error', ...errorDetails(error) }));
-            job.timer = setTimeout(() => {
-                finish(job, 'failed', '생성 대기 시간이 20분을 넘었습니다.', { reason: 'timeout', errorCode: 'ETIMEDOUT' });
-                upstream.destroy();
-            }, limits.timeoutMs);
-            job.timer.unref?.();
             upstream.end(upstreamBody);
         } catch (error) {
             finish(job, 'failed', '서버 내부 생성 요청에 실패했습니다.', { reason: 'request_setup_error', ...errorDetails(error) });
             upstream?.destroy();
+        }
+        }
+        job.timer = setTimeout(() => {
+            finish(job, 'failed', '생성 대기 시간이 20분을 넘었습니다.', { reason: 'timeout', errorCode: 'ETIMEDOUT' });
+            upstream?.destroy();
+        }, limits.timeoutMs);
+        job.timer.unref?.();
+        if (!preparer) send();
+        else {
+            job.diagnostic.phase = 'preparing';
+            trace(owner, 'preparing', id);
+            // A server-owned task. Browser disconnects only stop result polling.
+            Promise.resolve().then(() => {
+                job.prepareAbort.signal.throwIfAborted();
+                return preparer.prepare({ user: req.user, ticket: preparation.ticket,
+                    jobId: id, parentJobId, payload: routedPayload, signal: job.prepareAbort.signal });
+            }).then(payload => {
+                if (job.state !== 'running') return;
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+                    || Object.hasOwn(payload, '__silly_relay_prepare')) throw Error('invalid prepared payload');
+                const prepared = JSON.stringify(payload);
+                if (Buffer.byteLength(prepared) > limits.requestBytes) throw Error('prepared request too large');
+                // Review recovery must reuse the actual prepared prompt, never its placeholders.
+                const extra = job.recovery ? Buffer.byteLength(prepared) - Buffer.byteLength(job.recovery.body) : 0;
+                if (totalBytes - job.preparationBytes + extra > limits.totalBytes) throw Error('prepared request capacity');
+                totalBytes += extra - job.preparationBytes;
+                job.preparationBytes = 0;
+                if (job.recovery) { job.recovery.body = prepared; job.recoveryBytes += extra; }
+                upstreamBody = prepared;
+                trace(owner, 'prepared', id);
+                send();
+            }).catch(() => finish(job, 'failed', '서버 요청 준비에 실패했습니다. 준비 작업 내역을 확인해 주세요.', { reason: 'preparation_failed' }));
         }
         return job;
     }
@@ -296,7 +358,7 @@ function createRelay(overrides = {}) {
         router.post('/notification-settings', wrap((req, res) => res.json({ target: routing.set(ownerOf(req), req.body?.target) })));
         router.get('/status', wrap((req, res) => {
             const owner = ownerOf(req);
-            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, reviewRecovery: 1, translationObserver: true, notificationRouting: true, notificationTarget: routing.get(owner), diagnosticJournal: !!journal, owner });
+            res.json({ version: VERSION, protocol: 2, ready: !req.socket.encrypted, reloadRecovery: true, reviewRecovery: 1, translationObserver: true, notificationRouting: true, notificationTarget: routing.get(owner), diagnosticJournal: !!journal, preparations: [...preparers()].filter(([,p]) => p?.apiVersion === 1).map(([name]) => name), owner });
         }));
         router.get('/diagnostics', wrap(async (req, res) => {
             const owner = ownerOf(req);

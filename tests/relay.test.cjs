@@ -2441,3 +2441,62 @@ test('hiding during an active review preserves the checkpoint and restores only 
     assert.equal(page.recovery.list().length, 0); assert.equal(f.calls.length, 1);
     assert.ok(!b.messages.some(m => /검수를 마치지/.test(m)));
 });
+
+function installPreparer(t, prepare) {
+    const symbol=Symbol.for('silly-relay.preparers.v1'),old=globalThis[symbol];
+    globalThis[symbol]=new Map([['test-preparer',{apiVersion:1,prepare}]]);
+    t.after(()=>{if(old===undefined)delete globalThis[symbol];else globalThis[symbol]=old;});
+}
+test('optional preparation finishes without browser reads, preserves payload and submits once on duplicate POST',async t=>{
+    let release,entered=0;const gate=new Promise(r=>release=r);
+    installPreparer(t,async({user,payload,signal})=>{assert.equal(user.profile.handle,'alice');assert(!signal.aborted);entered++;await gate;return {...payload,messages:[{role:'system',content:'selected memory'}]};});
+    const f=await fixture(t),job=id(),body={model:'chosen',temperature:.7,duration:1,messages:[{role:'system',content:'reservation'}],__silly_relay_prepare:{provider:'test-preparer',ticket:'ticket'}};
+    assert.equal((await f.start(job,body)).status,202);assert.equal((await f.start(job,body)).status,202);
+    await delay(10);assert.equal(f.calls.length,0);assert.equal(entered,1);
+    release();await delay(40);const result=await f.get(job);assert.equal(result.state,'completed');assert.equal(f.calls.length,1);
+    assert.equal(f.calls[0].body.model,'chosen');assert.equal(f.calls[0].body.temperature,.7);assert.equal(f.calls[0].body.messages[0].content,'selected memory');assert(!('__silly_relay_prepare' in f.calls[0].body));
+});
+test('missing preparer rejects only opted-in requests and leaves ordinary Relay available',async t=>{
+    installPreparer(t,()=>assert.fail());const f=await fixture(t);
+    assert.equal((await f.start(id(),{__silly_relay_prepare:{provider:'absent',ticket:'ticket'}})).status,409);
+    const job=id();assert.equal((await f.start(job,{duration:1})).status,202);await delay(30);assert.equal((await f.get(job)).state,'completed');assert.equal(f.calls.length,1);
+});
+for(const action of ['cancel','timeout','failure'])test(`preparation ${action} never sends a partial prompt or falls back to direct generation`,async t=>{
+    let signal;installPreparer(t,async args=>{signal=args.signal;if(action==='failure')throw Error('test');await new Promise(resolve=>signal.addEventListener('abort',resolve,{once:true}));return args.payload;});
+    const f=await fixture(t,{timeoutMs:action==='timeout'?35:1000}),job=id();
+    await f.start(job,{__silly_relay_prepare:{provider:'test-preparer',ticket:'ticket'}});await delay(10);
+    if(action==='cancel')await f.request(`/jobs/${job}/cancel`,{method:'POST',body:'{}'});
+    await delay(60);assert.equal(f.calls.length,0);assert.equal((await f.get(job)).state,action==='cancel'?'cancelled':'failed');assert(signal.aborted);
+});
+test('review recovery stores prepared prompt so later reviews cannot re-run preparation',async t=>{
+    installPreparer(t,async({payload})=>({...payload,messages:[{role:'system',content:'final memory'}]}));
+    const f=await fixture(t),job=id(),body={duration:1,messages:[{role:'system',content:'reservation'}],__silly_relay_prepare:{provider:'test-preparer',ticket:'ticket'}};
+    const response=await f.request('/jobs',{method:'POST',body:JSON.stringify({id:job,path:PATH,body:JSON.stringify(body),recovery:{version:1,current:{owner:'reviewer',checkpoint:{step:1}}}})});
+    assert.equal(response.status,202);await delay(40);
+    const recovery=await (await f.request(`/jobs/${job}/recovery`)).json();
+    const actual=JSON.parse(recovery.body);assert.equal(actual.messages[0].content,'final memory');assert(!actual.__silly_relay_prepare);
+});
+test('browser transport refuses deferred prompts when disabled, unbound, or without recovery',async()=>{
+    const {createTransport}=await import('../transport.mjs');
+    for(const options of [{enabled:()=>false,shouldRelay:()=>true},{enabled:()=>true,shouldRelay:()=>false},{enabled:()=>true,shouldRelay:()=>true}]){
+        const transport=createTransport({origin:'https://local.test',fetchImpl:()=>assert.fail('placeholder must not reach network'),...options});
+        await assert.rejects(transport.fetch('https://local.test'+PATH,{method:'POST',body:JSON.stringify({__silly_relay_prepare:{provider:'test',ticket:'id'}})}));
+    }
+});
+
+test('live review sequences reuse a prepared ticket only through an owned completed parent',async t=>{
+    const parents=[];
+    installPreparer(t,async({payload,parentJobId})=>{parents.push(parentJobId);return {...payload,messages:[{role:'system',content:'same selected memory'}]};});
+    const f=await fixture(t),sequence={id:null},transportModule=await import('../transport.mjs');
+    const transport=transportModule.createTransport({origin:f.base,enabled:()=>true,fetchImpl:fetch,
+        prepareRecovery:async request=>{sequence.id ||= request.id;sequence.latestId=request.id;return true;}});
+    const body={duration:1,messages:[{role:'system',content:'reserved'}],__silly_relay_prepare:{provider:'test-preparer',ticket:'ticket'}};
+    const send=()=>transport.replyFetch(f.base+PATH,{method:'POST',headers:AUTH,body:JSON.stringify(body)},sequence);
+    await (await send()).text();const first=sequence.latestId;
+    await (await send()).text();const second=sequence.latestId;
+    await (await send()).text();
+    assert.deepEqual(parents,[undefined,first,second]);assert.equal(f.calls.length,3);
+    const forged={id:id(),path:PATH,body:JSON.stringify(body),preparationParent:first};
+    const other=await f.request('/jobs',{method:'POST',headers:{cookie:'user=bob'},body:JSON.stringify(forged)});
+    assert.equal(other.status,409);assert.equal(f.calls.length,3);
+});
